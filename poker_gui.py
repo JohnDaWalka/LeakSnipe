@@ -79,10 +79,53 @@ from models import Hand, HandDatabase
 from parsers import HandParser
 from analysis import LeakEngine, SummaryGenerator
 from importing import HandImporter, get_default_hh_paths
+from ocr_capture import OCRCaptureBridge, ReplayWindowCapture
 from utils import font_style as _font_style, canonical_path as _canonical_path
 
+# ── Global font system ────────────────────────────────────────────────────────
+# UI chrome (labels, buttons, tabs) uses Segoe UI — clean, proportional.
+# Data / hand history uses Consolas — monospace, aligns numbers neatly.
+_FF = "Segoe UI"    # proportional UI font
+_FM = "Consolas"    # monospace data font
 
-# Legacy globals — kept for backward compat during transition, driven by active theme
+_F_CAPTION     = (_FF, 9,  "normal")   # tiny hints, badges
+_F_CAPTION_I   = (_FF, 9,  "italic")   # italic captions / placeholders
+_F_BODY        = (_FF, 11, "normal")   # standard labels
+_F_BODY_I      = (_FF, 11, "italic")   # subtitles, secondary info
+_F_SEMIBOLD    = (_FF, 11, "bold")     # medium-weight labels
+_F_LABEL       = (_FF, 12, "bold")     # section / panel headings
+_F_TITLE       = (_FF, 14, "bold")     # tab-level titles
+_F_HEADER      = (_FF, 16, "bold")     # app header
+_F_DATA        = (_FM, 10, "normal")   # inline data values
+_F_DATA_MD     = (_FM, 11, "normal")   # medium data text (hand lists, stats)
+_F_DATA_BOLD   = (_FM, 11, "bold")     # prominent data
+_F_DATA_LG     = (_FM, 13, "bold")     # larger stat display
+_F_KPI         = (_FM, 28, "bold")     # dashboard KPI numbers
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Hand Tag Presets ─────────────────────────────────────────────────────────
+HAND_TAG_PRESETS = [
+    # (display_label, tag_key, hex_color, category)
+    ("⭐ For Review",  "For Review",  "#E8A838", "Review"),
+    ("📚 Study Later", "Study Later", "#7B9DD9", "Review"),
+    ("🎯 Hero Call",   "Hero Call",   "#5BBF6A", "Decision"),
+    ("🃏 Bluff",       "Bluff",       "#CF7ADB", "Decision"),
+    ("💰 Value Bet",   "Value Bet",   "#4FC3A1", "Decision"),
+    ("✅ Check Raise", "Check Raise", "#5097D9", "Decision"),
+    ("💥 Bad Beat",    "Bad Beat",    "#E85D5D", "Situation"),
+    ("🧊 Cooler",      "Cooler",      "#7BB8D9", "Situation"),
+    ("💣 Big Pot",     "Big Pot",     "#D9A650", "Situation"),
+    ("🔑 Key Hand",    "Key Hand",    "#A890D9", "Situation"),
+    ("❌ Misplay",     "Misplay",     "#E05050", "Mistake"),
+    ("📉 Bad Fold",    "Bad Fold",    "#E87040", "Mistake"),
+    ("📈 Bad Call",    "Bad Call",    "#DB6B6B", "Mistake"),
+    ("🏆 Tournament",  "Tournament",  "#9BD97A", "Other"),
+]
+# Quick color lookup by tag key
+HAND_TAG_COLORS = {entry[1]: entry[2] for entry in HAND_TAG_PRESETS}
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Legacy globals— kept for backward compat during transition, driven by active theme
 _active_theme = THEMES["Slate Blue"]
 BG_DARK   = _active_theme["bg_base"]
 BG_PANEL  = _active_theme["bg_panel"]
@@ -112,16 +155,16 @@ if not os.path.exists(SETTINGS_PATH):
         SETTINGS_PATH = PARENT_SETTINGS
 
 DEFAULT_SETTINGS = {
-    "hero_names": {"CoinPoker": "jdwalka", "BetACR": "JohnDaWalka", "GGPoker": "JohnDaWalka"},
+    "hero_names": {"CoinPoker": "jdwalka", "BetACR": "JohnDaWalka", "GGPoker": "JohnDaWalka", "ReplayPoker": ""},
     "scan_dirs": [
         {"path": r"D:\Hand2Note4Hh\CoinPoker", "site": "CoinPoker"},
         # BetACR live hand histories (WPN skin — written by ACR Poker client)
-        {"path": r"D:\ACR Poker\handHistory\JohnDaWalka", "site": "BetACR"},
-        {"path": r"D:\ACR Poker\handHistory\JohnDaWalka - Copy", "site": "BetACR"},
-        {"path": r"D:\ACR Poker\TournamentSummary\JohnDaWalka", "site": "BetACR"},
-        {"path": r"D:\HM3Archive\Winning Poker Network", "site": "BetACR"},
+        {"path": r"C:\ACR Poker\handHistory\JohnDaWalka", "site": "BetACR"},
+        {"path": r"C:\ACR Poker\handHistory\JohnDaWalka - Copy", "site": "BetACR"},
+        {"path": r"C:\ACR Poker\TournamentSummary\JohnDaWalka", "site": "BetACR"},
+        {"path": r"C:\HM3Archive\Winning Poker Network", "site": "BetACR"},
         # BetACR.eu — archived hand histories via Hand2Note
-        {"path": r"D:\Hand2Note4Hh\MyHandsArchive_H2N4\WinningPokerNetwork", "site": "BetACR"},
+        {"path": r"C:\Hand2Note4Hh\MyHandsArchive_H2N4\WinningPokerNetwork", "site": "BetACR"},
     ],
     "auto_refresh": True,
     "refresh_interval": 5,
@@ -140,8 +183,8 @@ DEFAULT_SETTINGS = {
 
 HUD_DENSITY_OPTIONS = ("mini", "compact", "standard", "expanded")
 HUD_ANCHOR_OPTIONS = ("top-left", "top-right", "bottom-left", "bottom-right")
-HUD_SITE_PRESET_OPTIONS = ("auto", "off", "CoinPoker", "BetACR", "GGPoker")
-HUD_PROFILE_SITES = ("CoinPoker", "BetACR", "GGPoker")
+HUD_SITE_PRESET_OPTIONS = ("auto", "off", "CoinPoker", "BetACR", "GGPoker", "ReplayPoker")
+HUD_PROFILE_SITES = ("CoinPoker", "BetACR", "GGPoker", "ReplayPoker")
 
 
 def normalize_hud_site_profiles(raw_profiles):
@@ -223,7 +266,22 @@ class Hand:
 
 
 # ─── Hand Database (SQLite) ───────────────────────────────────────────────────
-DB_PATH = os.path.join(BASE_DIR, "poker_hands.db")
+_DEFAULT_DB_PATH = r"F:\LeakSnipe\poker_hands.db"
+
+def _resolve_db_path(settings: dict = None) -> str:
+    """Return DB path from settings, env var, or F:\\LeakSnipe default."""
+    if settings:
+        p = settings.get("db_path", "").strip()
+        if p and os.path.dirname(p):
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            return p
+    env = os.environ.get("LEAKSNIPE_DB_PATH", "").strip()
+    if env:
+        return env
+    os.makedirs(os.path.dirname(_DEFAULT_DB_PATH), exist_ok=True)
+    return _DEFAULT_DB_PATH
+
+DB_PATH = _resolve_db_path()
 
 
 class HandDatabase:
@@ -773,6 +831,12 @@ class HandParser:
                 return "BetACR"
             if "GG Poker" in stripped or "GGPoker" in stripped or stripped.startswith("Poker Hand #PT"):
                 return "GGPoker"
+            if (
+                stripped.startswith("Replay Poker Hand #")
+                or stripped.startswith("***** Replay Poker Hand History for Game")
+                or ("Replay Poker" in stripped and ("Hand" in stripped or "Game" in stripped))
+            ):
+                return "ReplayPoker"
         return None
 
     def split_hands(self, text, site):
@@ -788,6 +852,13 @@ class HandParser:
                     hands.append("\n".join(current))
                 current = [line]
             elif site == "GGPoker" and (line.strip().startswith("Poker Hand #") or "GGPoker" in line or "GG Poker" in line):
+                if current:
+                    hands.append("\n".join(current))
+                current = [line]
+            elif site == "ReplayPoker" and (
+                line.strip().startswith("***** Replay Poker Hand History for Game")
+                or line.strip().startswith("Replay Poker Hand #")
+            ):
                 if current:
                     hands.append("\n".join(current))
                 current = [line]
@@ -831,12 +902,16 @@ class HandParser:
             return self._parse_acr(text, site_label="BetACR")
         elif site == "GGPoker":
             return self._parse_ggpoker(text)
+        elif site == "ReplayPoker":
+            return self._parse_replaypoker(text)
 
         # Fallback: Try to detect format from content
         if "CoinPoker Hand #" in text:
             return self._parse_coinpoker(text)
         if "Game Hand #" in text:
             return self._parse_acr(text, site_label="BetACR")
+        if "Replay Poker" in text:
+            return self._parse_replaypoker(text)
 
         return None
 
@@ -962,6 +1037,7 @@ class HandParser:
     def _parse_acr(self, text, site_label="BetACR"):
         h = Hand()
         h.site = site_label
+        h.raw_text = text
         lines = text.split("\n")
         hero_names = self.settings.get("hero_names", {})
         hero = hero_names.get(site_label) or hero_names.get("BetACR", "JohnDaWalka")
@@ -1023,9 +1099,17 @@ class HandParser:
             h.pot = float(pot_m.group(1))
 
         for line in lines:
-            wm = re.match(r"(.+?) collected \$?(\d+(?:\.\d+)?) from", line.strip())
+            stripped = line.strip()
+            wm = re.match(r"(.+?) collected \$?(\d+(?:\.\d+)?) from", stripped)
             if wm:
                 h.winners.append({"name": wm.group(1), "amount": float(wm.group(2))})
+                continue
+            summary_wm = re.match(
+                r"Seat \d+: (.+?)(?: \([^)]*\))* (?:showed \[[^\]]+\]|did not show|mucked(?: \[[^\]]+\])?) and won \$?(\d+(?:\.\d+)?)",
+                stripped,
+            )
+            if summary_wm:
+                h.winners.append({"name": summary_wm.group(1), "amount": float(summary_wm.group(2))})
 
         h.hero_won = self._calc_hero_result(h, hero)
         h.hero_position = self._calc_position(h, hero)
@@ -1035,6 +1119,175 @@ class HandParser:
     def _parse_ggpoker(self, text):
         """Stub GGPoker parser — returns None until full implementation is added."""
         return None
+
+    def _parse_replaypoker(self, text):
+        h = Hand()
+        h.site = "ReplayPoker"
+        lines = text.split("\n")
+        hero = self.settings.get("hero_names", {}).get("ReplayPoker", "")
+
+        hand_id = None
+        for pattern in (
+            r"Replay Poker Hand #(\d+)",
+            r"Replay Poker Hand History for Game (\d+)",
+            r"\*{5}\s*Hand (\d+)\s*\*{5}",
+        ):
+            match = re.search(pattern, text)
+            if match:
+                hand_id = match.group(1)
+                break
+        if not hand_id:
+            return None
+        h.hand_id = f"RP_{hand_id}"
+        h.game_type = "PLO" if "omaha" in text.lower() else "NLHE"
+
+        dm = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", text)
+        if dm:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+                try:
+                    h.date = datetime.strptime(dm.group(1), fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                h.date = datetime.now()
+        else:
+            h.date = datetime.now()
+
+        table_line = next((line.strip() for line in lines if line.strip().startswith("Table:")), "")
+        if table_line:
+            table_text = table_line.split(":", 1)[1].strip()
+            table_text = re.sub(r"\s+\(\d+\)$", "", table_text)
+            seats_match = re.search(r"\((\d+)\s*max\)", table_text, re.IGNORECASE)
+            if seats_match:
+                h.max_seats = int(seats_match.group(1))
+                table_text = re.sub(r"\s*\(\d+\s*max\)", "", table_text, flags=re.IGNORECASE).strip()
+            h.table_name = table_text
+
+        players_m = re.search(r"Players:\s*(\d+)", text, re.IGNORECASE)
+        if players_m and not h.max_seats:
+            h.max_seats = int(players_m.group(1))
+
+        button_line = re.search(r"Seat #(\d+) is the button", text)
+        if button_line:
+            h.button_seat = int(button_line.group(1))
+
+        for line in lines:
+            seat_m = re.match(
+                r"Seat (\d+): (.+?)(?: \(([^)]*)\))? \(\$?([\d,]+(?:\.\d+)?) in chips\)",
+                line.strip(),
+            )
+            if not seat_m:
+                continue
+            seat_num = int(seat_m.group(1))
+            name = seat_m.group(2).strip()
+            role = (seat_m.group(3) or "").strip().upper()
+            stack = self._parse_amount(seat_m.group(4))
+            if role in {"BTN", "BUTTON", "DEALER"} and not h.button_seat:
+                h.button_seat = seat_num
+            h.players[seat_num] = {"name": name, "stack": stack, "is_hero": name == hero}
+
+        if hero:
+            hc = re.search(r"Dealt to " + re.escape(hero) + r" \[(.+?)\]", text)
+            if hc:
+                h.hero_cards = hc.group(1)
+
+        h.streets = self._parse_streets_replaypoker(lines)
+        h.board_cards = self._extract_board(text) or self._collect_board_from_streets(h.streets)
+
+        pot_m = re.search(r"(?:Total pot|Pot):\s*\$?([\d,]+(?:\.\d+)?)", text, re.IGNORECASE)
+        if pot_m:
+            h.pot = self._parse_amount(pot_m.group(1))
+        rake_m = re.search(r"Rake:?\s*\$?([\d,]+(?:\.\d+)?)", text, re.IGNORECASE)
+        if rake_m:
+            h.rake = self._parse_amount(rake_m.group(1))
+
+        for line in lines:
+            stripped = line.strip()
+            collected_m = re.match(r"(.+?) collected \$?([\d,]+(?:\.\d+)?) from", stripped)
+            if collected_m:
+                h.winners.append({"name": collected_m.group(1), "amount": self._parse_amount(collected_m.group(2))})
+                continue
+            winner_m = re.match(
+                r"Winner:\s*(.+?)(?:\s+\(\$?([\d,]+(?:\.\d+)?)\))?$",
+                stripped,
+                re.IGNORECASE,
+            )
+            if winner_m:
+                h.winners.append(
+                    {
+                        "name": winner_m.group(1).strip(),
+                        "amount": self._parse_amount(winner_m.group(2) or "0"),
+                    }
+                )
+
+        if len(h.winners) == 1 and h.winners[0]["amount"] == 0.0 and h.pot > 0:
+            h.winners[0]["amount"] = h.pot
+
+        h.hero_won = self._calc_hero_result(h, hero)
+        h.hero_position = self._calc_position(h, hero)
+        return h
+
+    def _parse_streets_replaypoker(self, lines):
+        current_street = {"name": "Preflop", "cards": [], "actions": []}
+        streets = [current_street]
+        player_names = sorted(
+            {
+                match.group(2).strip()
+                for match in (
+                    re.match(
+                        r"Seat (\d+): (.+?)(?: \(([^)]*)\))? \(\$?([\d,]+(?:\.\d+)?) in chips\)",
+                        line.strip(),
+                    )
+                    for line in lines
+                )
+                if match
+            },
+            key=len,
+            reverse=True,
+        )
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("*** HOLE CARDS ***"):
+                continue
+            if stripped.startswith("*** FLOP ***"):
+                cards_m = re.search(r"\[(.+?)\]", stripped)
+                cards = cards_m.group(1).split() if cards_m else []
+                current_street = {"name": "Flop", "cards": cards, "actions": []}
+                streets.append(current_street)
+                continue
+            if stripped.startswith("*** TURN ***"):
+                cards_m = re.findall(r"\[(.+?)\]", stripped)
+                cards = cards_m[-1].split() if cards_m else []
+                current_street = {"name": "Turn", "cards": cards, "actions": []}
+                streets.append(current_street)
+                continue
+            if stripped.startswith("*** RIVER ***"):
+                cards_m = re.findall(r"\[(.+?)\]", stripped)
+                cards = cards_m[-1].split() if cards_m else []
+                current_street = {"name": "River", "cards": cards, "actions": []}
+                streets.append(current_street)
+                continue
+            if stripped.startswith("*** SHOW DOWN ***") or stripped.startswith("*** SUMMARY ***"):
+                continue
+            if not stripped or stripped.startswith("Seat ") or stripped.startswith("Table:") or stripped.startswith("Players:"):
+                continue
+            if stripped.startswith("Dealt to"):
+                continue
+            if ": " in stripped:
+                pname, action_str = stripped.split(": ", 1)
+                action, amount = self._parse_action(action_str)
+                if action:
+                    current_street["actions"].append({"player": pname, "action": action, "amount": amount})
+                continue
+            for pname in player_names:
+                if stripped.startswith(pname + " "):
+                    action, amount = self._parse_action(stripped[len(pname) + 1 :])
+                    if action:
+                        current_street["actions"].append({"player": pname, "action": action, "amount": amount})
+                    break
+        return streets
 
     def _parse_streets_acr(self, lines, hero):
         current_street = {"name": "Preflop", "cards": [], "actions": []}
@@ -1098,36 +1351,43 @@ class HandParser:
 
     # ── Shared helpers ────────────────────────────────────────────────────
     def _parse_action(self, action_str):
+        def _find_amount(pattern=r"(\d[\d,]*(?:\.\d+)?)"):
+            match = re.search(pattern, action_str)
+            return self._parse_amount(match.group(1)) if match else 0.0
+
         action_str = action_str.strip().lower()
         if action_str.startswith("fold"):
             return "fold", 0.0
         if action_str.startswith("check"):
             return "check", 0.0
         if action_str.startswith("call"):
-            am = re.search(r"(\d+(?:\.\d+)?)", action_str)
-            return "call", float(am.group(1)) if am else 0.0
+            return "call", _find_amount()
         if action_str.startswith("raise"):
-            am = re.search(r"to (\d+(?:\.\d+)?)", action_str)
-            if am:
-                return "raise", float(am.group(1))
-            am = re.search(r"(\d+(?:\.\d+)?)", action_str)
-            return "raise", float(am.group(1)) if am else 0.0
+            amount = _find_amount(r"to (\d[\d,]*(?:\.\d+)?)")
+            return "raise", amount if amount else _find_amount()
         if action_str.startswith("bet"):
-            am = re.search(r"(\d+(?:\.\d+)?)", action_str)
-            return "bet", float(am.group(1)) if am else 0.0
+            return "bet", _find_amount()
         if "all-in" in action_str or "allin" in action_str:
-            am = re.search(r"(\d+(?:\.\d+)?)", action_str)
-            return "raise", float(am.group(1)) if am else 0.0
+            return "raise", _find_amount()
         if action_str.startswith("posts"):
-            am = re.search(r"(\d+(?:\.\d+)?)", action_str)
-            return "post", float(am.group(1)) if am else 0.0
+            return "post", _find_amount()
         return None, 0.0
+
+    def _parse_amount(self, value):
+        cleaned = re.sub(r"[^\d.]", "", value or "")
+        return float(cleaned) if cleaned else 0.0
 
     def _extract_board(self, text):
         m = re.search(r"Board \[(.+?)\]", text)
         if m:
             return m.group(1).split()
         return []
+
+    def _collect_board_from_streets(self, streets):
+        board = []
+        for street in streets:
+            board.extend(street.get("cards", []))
+        return board
 
     def _calc_hero_result(self, h, hero):
         won: float = 0.0
@@ -1144,15 +1404,15 @@ class HandParser:
         raw = getattr(h, "raw_text", "") or ""
         if raw and hero:
             import re as _re
-            ub = _re.search(
+            for ub in _re.finditer(
                 r"Uncalled bet \(\$?(\d+(?:\.\d+)?)\) returned to "
                 + _re.escape(hero),
                 raw,
-            )
-            if ub:
+            ):
                 won += float(ub.group(1))
 
         invested: float = 0.0
+        preflop_raised = False
         for street in h.streets:
             # Bug fix #2: a "raises to $X" line stores the player's *total*
             # street commitment up to that raise.  Any prior "post" (blind) on
@@ -1173,6 +1433,8 @@ class HandParser:
                 if a == "raise":
                     last_raise_idx = i
             if last_raise_idx is not None:
+                if street.get("name") == "Preflop":
+                    preflop_raised = True
                 # Raise-to total covers everything up to this raise.
                 street_total = hero_acts[last_raise_idx][1]
                 # Add only actions that come *after* the raise (opponent
@@ -1186,6 +1448,14 @@ class HandParser:
                     amt for a, amt in hero_acts if a in ("call", "bet", "post")
                 )
             invested += street_total
+
+        if preflop_raised and raw and hero:
+            for ante in re.finditer(
+                re.escape(hero) + r" posts ante (\d+(?:\.\d+)?)",
+                raw,
+                re.IGNORECASE,
+            ):
+                invested += float(ante.group(1))
 
         if won > 0:
             return won - invested
@@ -1480,6 +1750,13 @@ class SummaryGenerator:
         lines.append("Generated by Poker Hand Tracker")
         lines.append("Paste this into ChatGPT or Grok for further analysis.")
         return "\n".join(lines)
+
+
+def _is_drive_root(path: str) -> bool:
+    """Return True if *path* is the root of a drive (e.g. 'C:\\'), to prevent
+    accidentally scanning an entire drive."""
+    p = os.path.normpath(path)
+    return p == os.path.splitdrive(p)[0] + os.sep
 
 
 # ─── File Watcher / Importer ──────────────────────────────────────────────────
@@ -2476,6 +2753,7 @@ HUD_SITE_PRESETS = {
     "ACR":       {"anchor": "top-right", "summary_offset": (-6, 0), "badge_offset": (-18, 0)},
     "BetACR":    {"anchor": "top-right", "summary_offset": (-6, 0), "badge_offset": (-18, 0)},
     "GGPoker":   {"anchor": "top-left", "summary_offset": (6, 0), "badge_offset": (18, 0)},
+    "ReplayPoker": {"anchor": "top-left", "summary_offset": (0, 0), "badge_offset": (0, 0)},
     "Unknown":   {"anchor": "top-left", "summary_offset": (0, 0), "badge_offset": (0, 0)},
 }
 
@@ -2495,7 +2773,7 @@ class TableDetector:
         # WPN / ACR branded windows (lobby / cashier)
         "ACR Poker", "Americas Cardroom", "Winning Poker",
         # Other sites
-        "CoinPoker", "BetACR",
+        "CoinPoker", "BetACR", "Replay Poker",
     ]
 
     # Lobby-only patterns — deprioritised when a table window exists
@@ -2570,7 +2848,7 @@ class MultiTableDetector:
     WINDOW_TITLES = [
         "Hold'em", "Omaha", "Stud",
         "ACR Poker", "Americas Cardroom", "Winning Poker",
-        "CoinPoker", "BetACR", "GGPoker", "GG Poker",
+        "CoinPoker", "BetACR", "GGPoker", "GG Poker", "Replay Poker",
         "PokerStars", "888poker", "partypoker", "iPoker",
         "WPN Poker", "Bovada",
     ]
@@ -4666,6 +4944,9 @@ class PokerApp(ctk.CTk):
         self.leak_engine = LeakEngine(self.settings)
         self.summary_gen = SummaryGenerator()
         self.ocr_engine = PokerOCR()
+        self.capture_bridge = OCRCaptureBridge()
+        self._capture_hotkey_thread = None
+        self._capture_poll_job = None
         self.current_stats = {}
         self.station_detector = StationDetector(self.settings)
         self.ev_calculator = EVCalculator()
@@ -4691,6 +4972,10 @@ class PokerApp(ctk.CTk):
         self._hud_layout_mode = False
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_app_close)
+        self._start_ocr_capture_bridge()
+        self._start_ocr_hotkeys()
+        self._schedule_ocr_bridge_poll()
         self._initial_scan()
 
         if self.settings.get("live_hud_enabled", False):
@@ -4705,12 +4990,18 @@ class PokerApp(ctk.CTk):
                                        text_color=self.theme["text"])
         self.tabview.pack(fill="both", expand=True, padx=8, pady=(8, 0))
 
-        _raw_dash     = self.tabview.add("Dashboard")
-        _raw_hands    = self.tabview.add("Hands")
-        _raw_leak     = self.tabview.add("Leaks")
-        _raw_ocr      = self.tabview.add("OCR")
-        _raw_ai       = self.tabview.add("AI / GTO")
-        _raw_settings = self.tabview.add("Settings")
+        # Full and abbreviated tab labels — swap when window gets narrow
+        self._tab_labels_full  = ["Dashboard", "Hands", "Leaks", "OCR", "AI / GTO", "Settings"]
+        self._tab_labels_short = ["Dash",      "Hands", "Leaks", "OCR", "AI/GTO",   "Config"]
+        for label in self._tab_labels_full:
+            self.tabview.add(label)
+
+        _raw_dash     = self.tabview.tab("Dashboard")
+        _raw_hands    = self.tabview.tab("Hands")
+        _raw_leak     = self.tabview.tab("Leaks")
+        _raw_ocr      = self.tabview.tab("OCR")
+        _raw_ai       = self.tabview.tab("AI / GTO")
+        _raw_settings = self.tabview.tab("Settings")
 
         def _scroll_tab(parent):
             sf = ctk.CTkScrollableFrame(
@@ -4737,6 +5028,39 @@ class PokerApp(ctk.CTk):
         self._build_settings_tab()
         self._build_status_bar()
         self._build_header_bar()
+
+        # Dynamically rename tabs when window width changes to avoid text clipping
+        _TAB_BREAK = 920
+        self._tabs_are_short = False
+        def _tabview_configure(event):
+            want_short = event.width < _TAB_BREAK
+            if want_short == self._tabs_are_short:
+                return
+            self._tabs_are_short = want_short
+            labels = self._tab_labels_short if want_short else self._tab_labels_full
+            try:
+                seg_btn = self.tabview._segmented_button
+                for btn, lbl in zip(seg_btn._buttons_dict.values(), labels):
+                    btn.configure(text=lbl)
+            except Exception:
+                pass
+        # Bind on the root window, not CTkTabview (CTkTabview.bind raises NotImplementedError)
+        self.bind("<Configure>", _tabview_configure, add="+")
+
+        # ── Fix tab-bar flicker ───────────────────────────────────────────────
+        # CTkTabview._segmented_button_callback does grid_forget(old) THEN
+        # grid(new), producing a single-frame blank flash between tabs.
+        # Swapping the order — show new first, hide old second — eliminates the
+        # white/background flash entirely without touching CTkTabview internals.
+        def _no_flicker_tab_callback(selected_name, _tv=self.tabview):
+            old_name = _tv._current_name
+            _tv._current_name = selected_name
+            _tv._set_grid_current_tab()             # place new tab first
+            if old_name != selected_name:
+                _tv._tab_dict[old_name].grid_forget()   # then remove old tab
+            if _tv._command is not None:
+                _tv._command()
+        self.tabview._segmented_button.configure(command=_no_flicker_tab_callback)
 
     def _panel(self, parent, *, fill="x", expand=False, padx=6, pady=4, fg_color=None):
         t = self.theme
@@ -4819,13 +5143,13 @@ class PokerApp(ctk.CTk):
             text_color=text_color,
             width=width,
             height=height,
-            corner_radius=10,
+            corner_radius=6,
             border_width=1,
-            border_color=_lighten(fg_color, 0.32),
-            font=("Consolas", 11, weight),
+            border_color=_lighten(fg_color, 0.28),
+            font=(_FF, 11, weight),
         )
 
-    def _create_scroll_textbox(self, parent, *, height=None, font=("Consolas", 11), wrap="word"):
+    def _create_scroll_textbox(self, parent, *, height=None, font=_F_DATA_MD, wrap="word"):
         container = tk.Frame(
             parent,
             bg=self.theme["bg_input"],
@@ -4892,21 +5216,15 @@ class PokerApp(ctk.CTk):
         command_copy.pack(side="left", fill="x", expand=True)
         ctk.CTkLabel(
             command_copy,
-            text="SESSION COMMAND",
+            text="Session Command",
             text_color=_lighten(self.theme["border_hl"], 0.12),
-            font=ctk.CTkFont(
-                family="Consolas",
-                size=12,
-                weight="bold",
-                slant="italic",
-                underline=True,
-            ),
+            font=ctk.CTkFont(family=_FF, size=13, weight="bold"),
         ).pack(anchor="w")
         ctk.CTkLabel(
             command_copy,
-            text="Live hands, tilt signal, and HUD state in one operating surface.",
+            text="Live hands · tilt signal · HUD control",
             text_color=self.theme["text_dim"],
-            font=ctk.CTkFont(family="Consolas", size=11, slant="italic"),
+            font=ctk.CTkFont(family=_FF, size=11, slant="italic"),
         ).pack(anchor="w", pady=(2, 0))
 
         chip_row = tk.Frame(command_row, bg=self.theme["bg_panel"])
@@ -4935,7 +5253,7 @@ class PokerApp(ctk.CTk):
                 ),
             ).pack(anchor="w", padx=12, pady=(6, 0))
             ctk.CTkLabel(chip, textvariable=value_var, text_color=self.theme["text"],
-                         font=("Consolas", 10), width=width, anchor="w", justify="left",
+                         font=_F_DATA, width=width, anchor="w", justify="left",
                          wraplength=max(width * 6, 120)).pack(anchor="w", padx=12, pady=(2, 10))
 
         self.dash_command_hands_var = ctk.StringVar(value="0 hands ready")
@@ -4961,21 +5279,23 @@ class PokerApp(ctk.CTk):
         # Inner frame owns the grid — avoids pack/grid conflict with _panel()'s accent line
         cards_row = tk.Frame(top, bg=t["bg_panel"])
         cards_row.pack(fill="x", padx=2, pady=(2, 6))
+        # DPI-aware card sizing: scale 158×100 base by system DPI factor
+        _dpi_scale = max(1.0, self.winfo_fpixels('1i') / 96.0)
+        _cw, _ch = round(158 * _dpi_scale), round(100 * _dpi_scale)
         for i, (label, default, color) in enumerate(card_defs):
             cards_row.grid_columnconfigure(i, weight=1)
-            # Shadow layer
+            # Shadow layer — outer size is DPI-scaled; inner frames fill via relwidth/relheight
             shadow = tk.Frame(cards_row, bg=_darken(t["bg_base"], 0.74),
-                              width=158, height=100)
+                              width=_cw, height=_ch)
             shadow.grid(row=0, column=i, padx=5, pady=8, sticky="nsew")
             shadow.grid_propagate(False)
-            inner_shadow = tk.Frame(shadow, bg=_blend(t["bg_panel"], t["bg_base"], 0.42),
-                                    width=156, height=98)
-            inner_shadow.place(x=1, y=1)
+            inner_shadow = tk.Frame(shadow, bg=_blend(t["bg_panel"], t["bg_base"], 0.42))
+            inner_shadow.place(x=1, y=1, relwidth=1, relheight=1)
             # Card on top of shadow (placed at 0,0, shadow shows at bottom-right)
             card = ctk.CTkFrame(inner_shadow, fg_color=t["bg_card"],
                                 corner_radius=12, border_width=1,
-                                border_color=t["border"], width=154, height=96)
-            card.place(x=0, y=0)
+                                border_color=t["border"])
+            card.place(x=0, y=0, relwidth=1, relheight=1)
             card.pack_propagate(False)
             # Colored top accent bar with a subtle gradient.
             accent = tk.Frame(card, bg=t["bg_card"], height=4)
@@ -4983,23 +5303,17 @@ class PokerApp(ctk.CTk):
             for segment in (_lighten(color, 0.24), color, _blend(color, t["bg_accent"], 0.48)):
                 tk.Frame(accent, bg=segment, width=10).pack(side="left", fill="both", expand=True)
             tk.Frame(card, bg=_lighten(t["bg_card"], 0.08), height=1).place(x=10, y=8, relwidth=0.87)
-            # Dim label
+            # KPI card label — Segoe UI italic, no underline, lighter weight
             ctk.CTkLabel(
                 card,
-                text=label.upper(),
+                text=label,
                 text_color=_blend(color, t["text_dim"], 0.35),
-                font=ctk.CTkFont(
-                    family="Consolas",
-                    size=10,
-                    weight="bold",
-                    slant="italic",
-                    underline=True,
-                ),
+                font=ctk.CTkFont(family=_FF, size=10, slant="italic"),
             ).place(relx=0.5, y=16, anchor="n")
-            # Value label — large and bold
+            # Value label — Consolas bold (data font)
             val = ctk.CTkLabel(card, text=default, text_color=color,
-                               font=("Consolas", 28, "bold"))
-            val.place(relx=0.5, y=44, anchor="n")
+                               font=_F_KPI)
+            val.place(relx=0.5, y=40, anchor="n")
             self.dash_cards[label] = val
 
         overview_row = ctk.CTkFrame(tab, fg_color="transparent")
@@ -5017,7 +5331,7 @@ class PokerApp(ctk.CTk):
         site_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
         self._section_label(site_frame, "By Site").pack(anchor="w", padx=8, pady=4)
         dash_site_box, self.dash_site_text = self._create_scroll_textbox(
-            site_frame, height=86, font=("Consolas", 12)
+            site_frame, height=86, font=(_FM, 12, "normal")
         )
         dash_site_box.pack(fill="x", padx=8, pady=(0, 8))
         self.dash_site_text.configure(state="disabled")
@@ -5052,11 +5366,11 @@ class PokerApp(ctk.CTk):
             tilt_frame,
             text="Waiting for data",
             text_color=self.theme["text_dim"],
-            font=("Consolas", 11),
+            font=_F_DATA_MD,
         )
         self.tilt_advice_label.pack(anchor="w", padx=12, pady=(0, 2))
         tilt_indicators_box, self.tilt_indicators_text = self._create_scroll_textbox(
-            tilt_frame, height=52, font=("Consolas", 10)
+            tilt_frame, height=52, font=_F_DATA
         )
         tilt_indicators_box.pack(fill="x", padx=8, pady=(0, 4))
         self.tilt_indicators_text.configure(state="disabled")
@@ -5077,12 +5391,19 @@ class PokerApp(ctk.CTk):
         self.dash_fig = Figure(figsize=(10, 3), dpi=80)
         self.dash_fig.patch.set_facecolor(self.theme["graph_bg"])
         self.dash_canvas = FigureCanvasTkAgg(self.dash_fig, master=self.graph_frame)
-        self.dash_canvas.get_tk_widget().pack(fill="x", padx=8, pady=(0, 8))
+        _gw = self.dash_canvas.get_tk_widget()
+        _gw.pack(fill="x", padx=8, pady=(0, 8))
+
+        def _resize_graph(event, _fig=self.dash_fig, _cv=self.dash_canvas):
+            w_in = max(4.0, (event.width - 16) / _fig.get_dpi())
+            _fig.set_size_inches(w_in, 3, forward=False)
+            _cv.draw_idle()
+        _gw.bind("<Configure>", _resize_graph)
 
         recent_frame = self._panel(tab, fill="both", expand=True)
         self._section_label(recent_frame, "Recent Hands").pack(anchor="w", padx=8, pady=4)
         dash_recent_box, self.dash_recent = self._create_scroll_textbox(
-            recent_frame, font=("Consolas", 11), wrap="none"
+            recent_frame, font=_F_DATA_MD, wrap="none"
         )
         dash_recent_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.dash_recent.configure(state="disabled")
@@ -5099,7 +5420,7 @@ class PokerApp(ctk.CTk):
         self.hand_site_menu = ctk.CTkOptionMenu(
             filter_frame,
             variable=self.hand_site_var,
-            values=["All", "CoinPoker", "BetACR", "GGPoker"],
+            values=["All", "CoinPoker", "BetACR", "GGPoker", "ReplayPoker"],
             fg_color=self.theme["bg_accent"],
             button_color=self.theme["bg_hover"],
             text_color=self.theme["text"],
@@ -5146,7 +5467,7 @@ class PokerApp(ctk.CTk):
                                         border_width=1, border_color=self.theme["border"])
         adv_filter_frame.pack(fill="x", padx=6, pady=(0, 2))
 
-        ctk.CTkLabel(adv_filter_frame, text="From", text_color=self.theme["text"], font=("Consolas", 11)).pack(side="left", padx=(6, 2))
+        ctk.CTkLabel(adv_filter_frame, text="From", text_color=self.theme["text"], font=_F_BODY).pack(side="left", padx=(6, 2))
         self.filter_date_from_var = ctk.StringVar(value="")
         ctk.CTkEntry(
             adv_filter_frame,
@@ -5155,10 +5476,10 @@ class PokerApp(ctk.CTk):
             text_color=self.theme["text"],
             width=90,
             placeholder_text="MM/DD/YYYY",
-            font=("Consolas", 10),
+            font=_F_DATA,
         ).pack(side="left", padx=2)
 
-        ctk.CTkLabel(adv_filter_frame, text="To", text_color=self.theme["text"], font=("Consolas", 11)).pack(side="left", padx=(6, 2))
+        ctk.CTkLabel(adv_filter_frame, text="To",text_color=self.theme["text"], font=_F_BODY).pack(side="left", padx=(6, 2))
         self.filter_date_to_var = ctk.StringVar(value="")
         ctk.CTkEntry(
             adv_filter_frame,
@@ -5167,10 +5488,10 @@ class PokerApp(ctk.CTk):
             text_color=self.theme["text"],
             width=90,
             placeholder_text="MM/DD/YYYY",
-            font=("Consolas", 10),
+            font=_F_DATA,
         ).pack(side="left", padx=2)
 
-        ctk.CTkLabel(adv_filter_frame, text="Pot", text_color=self.theme["text"], font=("Consolas", 11)).pack(side="left", padx=(10, 2))
+        ctk.CTkLabel(adv_filter_frame, text="Pot",text_color=self.theme["text"], font=_F_BODY).pack(side="left", padx=(10, 2))
         self.filter_pot_min_var = ctk.StringVar(value="")
         ctk.CTkEntry(
             adv_filter_frame,
@@ -5179,7 +5500,7 @@ class PokerApp(ctk.CTk):
             text_color=self.theme["text"],
             width=60,
             placeholder_text="Min",
-            font=("Consolas", 10),
+            font=_F_DATA,
         ).pack(side="left", padx=2)
 
         self.filter_pot_max_var = ctk.StringVar(value="")
@@ -5190,10 +5511,10 @@ class PokerApp(ctk.CTk):
             text_color=self.theme["text"],
             width=60,
             placeholder_text="Max",
-            font=("Consolas", 10),
+            font=_F_DATA,
         ).pack(side="left", padx=2)
 
-        ctk.CTkLabel(adv_filter_frame, text="Game", text_color=self.theme["text"], font=("Consolas", 11)).pack(side="left", padx=(10, 2))
+        ctk.CTkLabel(adv_filter_frame, text="Game", text_color=self.theme["text"], font=_F_BODY).pack(side="left", padx=(10, 2))
         self.filter_type_var = ctk.StringVar(value="All")
         ctk.CTkOptionMenu(
             adv_filter_frame,
@@ -5205,11 +5526,11 @@ class PokerApp(ctk.CTk):
             width=100,
             dropdown_fg_color=self.theme["bg_card"],
             dropdown_hover_color=self.theme["bg_accent"],
-            font=("Consolas", 10),
+            font=_F_DATA,
             command=lambda _: self._refresh_hands_list(),
         ).pack(side="left", padx=2)
 
-        ctk.CTkLabel(adv_filter_frame, text="Tag", text_color=self.theme["text"], font=("Consolas", 11)).pack(side="left", padx=(10, 2))
+        ctk.CTkLabel(adv_filter_frame, text="Tag",text_color=self.theme["text"], font=_F_BODY).pack(side="left", padx=(10, 2))
         self.filter_tag_var = ctk.StringVar(value="All")
         self.filter_tag_menu = ctk.CTkOptionMenu(
             adv_filter_frame,
@@ -5221,13 +5542,13 @@ class PokerApp(ctk.CTk):
             width=110,
             dropdown_fg_color=self.theme["bg_card"],
             dropdown_hover_color=self.theme["bg_accent"],
-            font=("Consolas", 10),
+            font=_F_DATA,
             command=lambda _: self._refresh_hands_list(),
         )
         self.filter_tag_menu.pack(side="left", padx=2)
 
         self._action_button(adv_filter_frame, "Apply", self._refresh_hands_list, width=64, height=24, bold=True).pack(side="left", padx=(8, 2))
-        ctk.CTkLabel(adv_filter_frame, text="Villain", text_color=self.theme["text"], font=("Consolas", 11)).pack(side="left", padx=(10, 2))
+        ctk.CTkLabel(adv_filter_frame, text="Villain", text_color=self.theme["text"], font=_F_BODY).pack(side="left", padx=(10, 2))
         self.filter_opp_type_var = ctk.StringVar(value="All")
         self.filter_opp_type_menu = ctk.CTkOptionMenu(
             adv_filter_frame,
@@ -5239,7 +5560,7 @@ class PokerApp(ctk.CTk):
             width=120,
             dropdown_fg_color=self.theme["bg_card"],
             dropdown_hover_color=self.theme["bg_accent"],
-            font=("Consolas", 10),
+            font=_F_DATA,
             command=lambda _: self._refresh_hands_list(),
         )
         self.filter_opp_type_menu.pack(side="left", padx=2)
@@ -5258,7 +5579,7 @@ class PokerApp(ctk.CTk):
             fg_color=self.theme["bg_accent"],
             hover_color=self.theme["green"],
             text_color=self.theme["text"],
-            font=("Consolas", 11),
+            font=_F_DATA_MD,
             checkbox_width=18,
             checkbox_height=18,
             command=self._toggle_select_all,
@@ -5268,7 +5589,7 @@ class PokerApp(ctk.CTk):
             sel_frame,
             text="0 selected",
             text_color=self.theme["text_dim"],
-            font=("Consolas", 11),
+            font=_F_DATA_MD,
         )
         self.hand_sel_count_label.pack(side="left", padx=8)
 
@@ -5278,7 +5599,9 @@ class PokerApp(ctk.CTk):
         self._action_button(sel_frame, "Analyze", self._analyze_filtered, tone="accent", width=96, bold=True).pack(side="left", padx=4)
         self._action_button(sel_frame, "Export", self._export_filtered, width=82).pack(side="right", padx=4)
 
-        hand_list_container = ctk.CTkFrame(tab, fg_color=self.theme["bg_input"])
+        hand_list_container = ctk.CTkFrame(tab, fg_color=self.theme["bg_input"],
+                                           border_width=1, border_color=self.theme["border"],
+                                           corner_radius=10)
         hand_list_container.pack(fill="both", expand=True, padx=6, pady=2)
 
         header_text = f"  {'Date':14s} {'Site':10s} {'Game':5s} {'Cards':8s} {'Pos':4s} {'Net':>8s} {'Pot':>7s} {'EV':>7s}  Tags"
@@ -5286,7 +5609,7 @@ class PokerApp(ctk.CTk):
             hand_list_container,
             text=header_text,
             text_color=self.theme["gold"],
-            font=("Consolas", 11, "bold"),
+            font=_F_DATA_BOLD,
             anchor="w",
         )
         header_label.pack(fill="x", padx=2, pady=(2, 0))
@@ -5295,7 +5618,7 @@ class PokerApp(ctk.CTk):
             hand_list_container,
             bg=self.theme["bg_input"],
             fg=self.theme["text"],
-            font=("Consolas", 11),
+            font=_F_DATA_MD,
             relief="flat",
             cursor="arrow",
             selectbackground=self.theme["select_bg"],
@@ -5328,7 +5651,7 @@ class PokerApp(ctk.CTk):
         hands_xscrollbar.pack(fill="x", side="bottom")
         self.hands_text.configure(yscrollcommand=hands_scrollbar.set, xscrollcommand=hands_xscrollbar.set)
 
-        self.hand_count_label = ctk.CTkLabel(tab, text="0 hands", text_color=self.theme["text_dim"], font=("Consolas", 10))
+        self.hand_count_label = ctk.CTkLabel(tab, text="0 hands", text_color=self.theme["text_dim"], font=_F_DATA)
         self.hand_count_label.pack(anchor="w", padx=10, pady=(0, 2))
 
         detail_frame = ctk.CTkFrame(tab, fg_color=self.theme["bg_panel"],
@@ -5365,32 +5688,117 @@ class PokerApp(ctk.CTk):
             _title_cv.itemconfigure(_text_id,   text=kw.get("text", "Details")),
         ) if "text" in kw else None
 
+        # ── Inline tag strip ──
+        self._detail_tag_strip_frame = tk.Frame(detail_frame, bg=self.theme["bg_panel"])
+        self._detail_tag_strip_frame.pack(fill="x", padx=8, pady=(0, 2))
+        self._detail_tag_hand = None   # currently displayed hand
+        # Populated in _refresh_detail_tag_strip()
+
         hand_detail_box, self.hand_detail_text = self._create_scroll_textbox(
-            detail_frame, font=("Consolas", 10), wrap="none"
+            detail_frame, font=_F_DATA, wrap="none"
         )
         hand_detail_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
         self._hand_objects = {}
         self._selected_hand_ids = set()
 
+    def _refresh_detail_tag_strip(self, hand=None):
+        """Rebuild the inline tag strip for the given hand (or clear it)."""
+        frame = self._detail_tag_strip_frame
+        for w in frame.winfo_children():
+            w.destroy()
+        self._detail_tag_hand = hand
+        if hand is None:
+            return
+        t = self.theme
+        current_tags = set(self.db.get_tags(hand.hand_id))
+
+        # Label
+        tk.Label(frame, text="Tags:", bg=t["bg_panel"], fg=t["text_dim"],
+                 font=_F_CAPTION).pack(side="left", padx=(0, 6))
+
+        def _make_toggle(entry):
+            label, key, color, _cat = entry
+            active = key in current_tags
+
+            bg_on  = color
+            bg_off = _blend(color, t["bg_panel"], 0.82)
+            fg_on  = "#111111"
+            fg_off = _lighten(color, 0.25)
+            border_col = _blend(color, t["bg_panel"], 0.4)
+
+            btn_frame = tk.Frame(frame, bg=border_col, padx=1, pady=1)
+            btn_frame.pack(side="left", padx=2, pady=2)
+            btn = tk.Button(
+                btn_frame,
+                text=label,
+                bg=bg_on if active else bg_off,
+                fg=fg_on if active else fg_off,
+                activebackground=bg_on,
+                activeforeground=fg_on,
+                font=(_FF, 9, "bold") if active else (_FF, 9, "normal"),
+                relief="flat",
+                bd=0,
+                padx=7,
+                pady=2,
+                cursor="hand2",
+            )
+            btn.pack()
+
+            def _toggle(k=key, b=btn, on=bg_on, off=bg_off, fon=fg_on, foff=fg_off):
+                cur = set(self.db.get_tags(self._detail_tag_hand.hand_id))
+                if k in cur:
+                    self.db.remove_tag(self._detail_tag_hand.hand_id, k)
+                    b.configure(bg=off, fg=foff, font=(_FF, 9, "normal"))
+                else:
+                    self.db.add_tag(self._detail_tag_hand.hand_id, k)
+                    b.configure(bg=on, fg=fon, font=(_FF, 9, "bold"))
+                self._refresh_tag_filter()
+
+            btn.configure(command=_toggle)
+
+        for entry in HAND_TAG_PRESETS:
+            _make_toggle(entry)
+
+        # Custom tag quick-entry
+        tk.Frame(frame, bg=t["border"], width=1).pack(side="left", fill="y", padx=6, pady=2)
+        custom_var = tk.StringVar()
+        custom_entry = tk.Entry(frame, textvariable=custom_var, bg=t["bg_input"], fg=t["text"],
+                                insertbackground=t["text"], relief="flat", bd=1,
+                                font=(_FF, 9), width=10)
+        custom_entry.pack(side="left", padx=2, pady=3)
+        custom_entry.insert(0, "custom…")
+        custom_entry.bind("<FocusIn>", lambda e: custom_entry.delete(0, "end") if custom_var.get() == "custom…" else None)
+
+        def _add_custom():
+            tag = custom_var.get().strip()
+            if tag and tag != "custom…" and self._detail_tag_hand:
+                self.db.add_tag(self._detail_tag_hand.hand_id, tag)
+                self._refresh_tag_filter()
+                self._refresh_detail_tag_strip(self._detail_tag_hand)
+        custom_entry.bind("<Return>", lambda e: _add_custom())
+        tk.Button(frame, text="+", bg=t["bg_accent"], fg=t["text"],
+                  font=(_FF, 9, "bold"), relief="flat", bd=0, padx=6, pady=2,
+                  cursor="hand2", command=_add_custom).pack(side="left", padx=1)
+
     def _build_leak_tab(self):
         tab = self.tab_leak
         top = self._panel(tab, pady=6)
-        ctk.CTkLabel(top, text="Leak Analysis", text_color=self.theme["gold"], font=("Consolas", 16, "bold")).pack(pady=8)
+        ctk.CTkLabel(top, text="Leak Analysis", text_color=self.theme["gold"], font=_F_HEADER).pack(pady=8)
 
         self.leak_stats_frame = self._panel(tab)
 
         self.leak_alerts_frame = self._panel(tab)
         self._section_label(self.leak_alerts_frame, "Alerts").pack(anchor="w", padx=8, pady=4)
         leak_alerts_box, self.leak_alerts_text = self._create_scroll_textbox(
-            self.leak_alerts_frame, height=120, font=("Consolas", 12)
+            self.leak_alerts_frame, height=120, font=(_FM, 12, "normal")
         )
         leak_alerts_box.pack(fill="x", padx=8, pady=(0, 8))
 
         pos_frame = self._panel(tab, fill="both", expand=True)
         self._section_label(pos_frame, "By Position").pack(anchor="w", padx=8, pady=4)
         leak_pos_box, self.leak_pos_text = self._create_scroll_textbox(
-            pos_frame, font=("Consolas", 12), wrap="none"
+            pos_frame, font=(_FM, 12, "normal"), wrap="none"
         )
         leak_pos_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
@@ -5404,7 +5812,7 @@ class PokerApp(ctk.CTk):
         site_frame = self._panel(tab)
         self._section_label(site_frame, "By Site").pack(anchor="w", padx=8, pady=4)
         leak_site_box, self.leak_site_text = self._create_scroll_textbox(
-            site_frame, height=80, font=("Consolas", 12)
+            site_frame, height=80, font=(_FM, 12, "normal")
         )
         leak_site_box.pack(fill="x", padx=8, pady=(0, 8))
 
@@ -5422,8 +5830,64 @@ class PokerApp(ctk.CTk):
         self._action_button(btn_row, "Copy", self._ocr_copy_analysis, width=84).pack(side="left", padx=4)
         self._action_button(btn_row, "Save OCR", self._ocr_save_to_db, width=96).pack(side="right", padx=4)
 
+        capture_row = ctk.CTkFrame(top_frame, fg_color=self.theme["bg_panel"])
+        capture_row.pack(fill="x", padx=8, pady=(0, 4))
+        self._action_button(
+            capture_row,
+            "Capture Replay Window",
+            lambda: self._ocr_capture_replay_window(analyze=True),
+            tone="accent",
+            width=170,
+            bold=True,
+        ).pack(side="left", padx=4)
+        self._action_button(
+            capture_row,
+            "Paste + Analyze",
+            lambda: self._ocr_load_clipboard_image(analyze=True),
+            width=130,
+        ).pack(side="left", padx=4)
+        self._action_button(
+            capture_row,
+            "Start Bridge",
+            self._start_ocr_capture_bridge,
+            width=100,
+        ).pack(side="left", padx=4)
+        self._action_button(
+            capture_row,
+            "Stop Bridge",
+            self._stop_ocr_capture_bridge,
+            tone="neutral",
+            width=100,
+        ).pack(side="left", padx=4)
+
+        self.ocr_capture_status_var = ctk.StringVar(value="Capture: ready")
+        ctk.CTkLabel(
+            top_frame,
+            textvariable=self.ocr_capture_status_var,
+            text_color=self.theme["text_dim"],
+            font=_F_DATA,
+        ).pack(anchor="w", padx=12, pady=(0, 2))
+
+        self.ocr_bridge_status_var = ctk.StringVar(value="Bridge: starting...")
+        ctk.CTkLabel(
+            top_frame,
+            textvariable=self.ocr_bridge_status_var,
+            text_color=self.theme["text_dim"],
+            font=_F_CAPTION,
+        ).pack(anchor="w", padx=12, pady=(0, 2))
+
+        self.ocr_hotkeys_status_var = ctk.StringVar(
+            value="Hotkeys: Ctrl+Shift+R capture Replay window | Ctrl+Shift+V paste clipboard image"
+        )
+        ctk.CTkLabel(
+            top_frame,
+            textvariable=self.ocr_hotkeys_status_var,
+            text_color=self.theme["text_dim"],
+            font=_F_CAPTION,
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+
         self.ocr_file_var = ctk.StringVar(value="No image")
-        ctk.CTkLabel(top_frame, textvariable=self.ocr_file_var, text_color=self.theme["text_dim"], font=("Consolas", 10)).pack(anchor="w", padx=12, pady=(0, 4))
+        ctk.CTkLabel(top_frame, textvariable=self.ocr_file_var, text_color=self.theme["text_dim"], font=_F_DATA).pack(anchor="w", padx=12, pady=(0, 4))
 
         content = self._panel(tab, fill="both", expand=True, pady=(0, 2))
         content.grid_columnconfigure(0, weight=1)
@@ -5432,13 +5896,13 @@ class PokerApp(ctk.CTk):
 
         left = ctk.CTkFrame(content, fg_color=self.theme["bg_input"], corner_radius=8)
         left.grid(row=0, column=0, sticky="nsew", padx=(4, 2), pady=4)
-        ctk.CTkLabel(left, text="Preview", text_color=self.theme["text_dim"], font=("Consolas", 11)).pack(anchor="w", padx=6, pady=2)
+        ctk.CTkLabel(left, text="Preview", text_color=self.theme["text_dim"], font=_F_BODY).pack(anchor="w", padx=6, pady=2)
 
         self.ocr_preview_label = ctk.CTkLabel(
             left,
             text="No image\n\nPaste or browse to start",
             text_color=self.theme["text_dim"],
-            font=("Consolas", 12),
+            font=(_FM, 12, "normal"),
             fg_color=self.theme["bg_input"],
         )
         self.ocr_preview_label.pack(fill="both", expand=True, padx=4, pady=4)
@@ -5446,10 +5910,10 @@ class PokerApp(ctk.CTk):
 
         right = ctk.CTkFrame(content, fg_color=self.theme["bg_input"], corner_radius=8)
         right.grid(row=0, column=1, sticky="nsew", padx=(2, 4), pady=4)
-        ctk.CTkLabel(right, text="Result", text_color=self.theme["text_dim"], font=("Consolas", 11)).pack(anchor="w", padx=6, pady=2)
+        ctk.CTkLabel(right, text="Result", text_color=self.theme["text_dim"], font=_F_BODY).pack(anchor="w", padx=6, pady=2)
 
         ocr_result_box, self.ocr_result_text = self._create_scroll_textbox(
-            right, font=("Consolas", 11), wrap="none"
+            right, font=_F_DATA_MD, wrap="none"
         )
         ocr_result_box.pack(fill="both", expand=True, padx=4, pady=4)
         ocr_method = "Tesseract + Windows OCR fallback" if HAS_TESSERACT else "Windows built-in OCR"
@@ -5469,21 +5933,21 @@ class PokerApp(ctk.CTk):
         self._ocr_current_raw_text = ""
 
         convert_frame = self._panel(tab, pady=(2, 2))
-        ctk.CTkLabel(convert_frame, text="Save Hand", text_color=self.theme["gold"], font=("Consolas", 12, "bold")).grid(row=0, column=0, columnspan=6, sticky="w", padx=8, pady=4)
+        ctk.CTkLabel(convert_frame, text="Save Hand", text_color=self.theme["gold"], font=_F_LABEL).grid(row=0, column=0, columnspan=6, sticky="w", padx=8, pady=4)
 
-        ctk.CTkLabel(convert_frame, text="Hero", text_color=self.theme["text"], font=("Consolas", 11)).grid(row=1, column=0, padx=4, pady=2, sticky="w")
+        ctk.CTkLabel(convert_frame, text="Hero", text_color=self.theme["text"], font=_F_BODY).grid(row=1, column=0, padx=4, pady=2, sticky="w")
         self.ocr_hero_cards_var = ctk.StringVar()
         ctk.CTkEntry(convert_frame, textvariable=self.ocr_hero_cards_var, fg_color=self.theme["bg_input"], text_color=self.theme["text"], width=100).grid(row=1, column=1, padx=4, pady=2, sticky="w")
 
-        ctk.CTkLabel(convert_frame, text="Board", text_color=self.theme["text"], font=("Consolas", 11)).grid(row=1, column=2, padx=4, pady=2, sticky="w")
+        ctk.CTkLabel(convert_frame, text="Board", text_color=self.theme["text"], font=_F_BODY).grid(row=1, column=2, padx=4, pady=2, sticky="w")
         self.ocr_board_var = ctk.StringVar()
         ctk.CTkEntry(convert_frame, textvariable=self.ocr_board_var, fg_color=self.theme["bg_input"], text_color=self.theme["text"], width=140).grid(row=1, column=3, padx=4, pady=2, sticky="w")
 
-        ctk.CTkLabel(convert_frame, text="Pot", text_color=self.theme["text"], font=("Consolas", 11)).grid(row=1, column=4, padx=4, pady=2, sticky="w")
+        ctk.CTkLabel(convert_frame, text="Pot", text_color=self.theme["text"], font=_F_BODY).grid(row=1, column=4, padx=4, pady=2, sticky="w")
         self.ocr_pot_var = ctk.StringVar(value="0")
         ctk.CTkEntry(convert_frame, textvariable=self.ocr_pot_var, fg_color=self.theme["bg_input"], text_color=self.theme["text"], width=80).grid(row=1, column=5, padx=4, pady=2, sticky="w")
 
-        ctk.CTkLabel(convert_frame, text="Pos", text_color=self.theme["text"], font=("Consolas", 11)).grid(row=2, column=0, padx=4, pady=2, sticky="w")
+        ctk.CTkLabel(convert_frame, text="Pos", text_color=self.theme["text"], font=_F_BODY).grid(row=2, column=0, padx=4, pady=2, sticky="w")
         self.ocr_position_var = ctk.StringVar(value="BTN")
         ctk.CTkOptionMenu(
             convert_frame,
@@ -5497,16 +5961,16 @@ class PokerApp(ctk.CTk):
             dropdown_hover_color=self.theme["bg_accent"],
         ).grid(row=2, column=1, padx=4, pady=2, sticky="w")
 
-        ctk.CTkLabel(convert_frame, text="Net", text_color=self.theme["text"], font=("Consolas", 11)).grid(row=2, column=2, padx=4, pady=2, sticky="w")
+        ctk.CTkLabel(convert_frame, text="Net", text_color=self.theme["text"], font=_F_BODY).grid(row=2, column=2, padx=4, pady=2, sticky="w")
         self.ocr_result_var = ctk.StringVar(value="0")
         ctk.CTkEntry(convert_frame, textvariable=self.ocr_result_var, fg_color=self.theme["bg_input"], text_color=self.theme["text"], width=80).grid(row=2, column=3, padx=4, pady=2, sticky="w")
 
-        ctk.CTkLabel(convert_frame, text="Site", text_color=self.theme["text"], font=("Consolas", 11)).grid(row=2, column=4, padx=4, pady=2, sticky="w")
+        ctk.CTkLabel(convert_frame, text="Site", text_color=self.theme["text"], font=_F_BODY).grid(row=2, column=4, padx=4, pady=2, sticky="w")
         self.ocr_site_var = ctk.StringVar(value="Manual")
         ctk.CTkOptionMenu(
             convert_frame,
             variable=self.ocr_site_var,
-            values=["CoinPoker", "BetACR", "GGPoker", "Manual"],
+            values=["CoinPoker", "BetACR", "GGPoker", "ReplayPoker", "Manual"],
             fg_color=self.theme["bg_accent"],
             button_color=self.theme["bg_hover"],
             text_color=self.theme["text"],
@@ -5515,15 +5979,15 @@ class PokerApp(ctk.CTk):
             dropdown_hover_color=self.theme["bg_accent"],
         ).grid(row=2, column=5, padx=4, pady=2, sticky="w")
 
-        ctk.CTkLabel(convert_frame, text="Notes", text_color=self.theme["text"], font=("Consolas", 11)).grid(row=3, column=0, padx=4, pady=2, sticky="w")
+        ctk.CTkLabel(convert_frame, text="Notes", text_color=self.theme["text"], font=_F_BODY).grid(row=3, column=0, padx=4, pady=2, sticky="w")
         self.ocr_notes_var = ctk.StringVar()
         ctk.CTkEntry(convert_frame, textvariable=self.ocr_notes_var, fg_color=self.theme["bg_input"], text_color=self.theme["text"], width=350).grid(row=3, column=1, columnspan=4, padx=4, pady=2, sticky="w")
         self._action_button(convert_frame, "Save Hand", self._ocr_save_as_hand, tone="success", width=98, bold=True).grid(row=3, column=5, padx=4, pady=2)
 
         history_frame = self._panel(tab, pady=(2, 4))
-        ctk.CTkLabel(history_frame, text="Recent OCR", text_color=self.theme["gold"], font=("Consolas", 11, "bold")).pack(anchor="w", padx=8, pady=2)
+        ctk.CTkLabel(history_frame, text="Recent OCR", text_color=self.theme["gold"], font=_F_DATA_BOLD).pack(anchor="w", padx=8, pady=2)
         ocr_history_box, self.ocr_history_text = self._create_scroll_textbox(
-            history_frame, height=70, font=("Consolas", 10), wrap="none"
+            history_frame, height=70, font=_F_DATA, wrap="none"
         )
         ocr_history_box.pack(fill="x", padx=8, pady=(0, 4))
         self.ocr_history_text.configure(state="disabled")
@@ -5539,18 +6003,7 @@ class PokerApp(ctk.CTk):
 
     def _ocr_paste(self):
         """Grab image from clipboard and save to temp file."""
-        try:
-            from PIL import ImageGrab
-            img = ImageGrab.grabclipboard()
-            if img is None:
-                self._set_status("No image found on clipboard")
-                return
-            tmp = os.path.join(tempfile.gettempdir(), "poker_ocr_clipboard.png")
-            img.save(tmp, "PNG")
-            self._ocr_load_image(tmp)
-            self._set_status("Image pasted from clipboard")
-        except Exception as e:
-            self._set_status(f"Clipboard error: {e}")
+        self._ocr_load_clipboard_image(analyze=False, site=None)
 
     def _ocr_load_image(self, path):
         self._ocr_current_path = path
@@ -5712,6 +6165,170 @@ class PokerApp(ctk.CTk):
         except Exception:
             pass
 
+    def _ocr_load_clipboard_image(self, analyze=False, site="ReplayPoker"):
+        try:
+            from PIL import ImageGrab
+
+            img = ImageGrab.grabclipboard()
+            if img is None or isinstance(img, list):
+                self._set_status("No image found on clipboard")
+                return False
+            tmp = os.path.join(tempfile.gettempdir(), f"poker_ocr_clipboard_{int(time.time() * 1000)}.png")
+            img.save(tmp, "PNG")
+            self._ocr_process_image_capture(tmp, source="clipboard", site=site, analyze=analyze)
+            return True
+        except Exception as e:
+            self._set_status(f"Clipboard error: {e}")
+            return False
+
+    def _ocr_capture_replay_window(self, analyze=True):
+        try:
+            capture = ReplayWindowCapture.capture_window(allow_foreground_fallback=True)
+        except Exception as exc:
+            self._set_status(f"Replay window capture failed: {exc}")
+            return
+        self._ocr_process_image_capture(
+            capture["path"],
+            source=f"window:{capture.get('title', 'Replay Poker')}",
+            site="ReplayPoker",
+            analyze=analyze,
+        )
+
+    def _ocr_process_image_capture(self, path, source="capture", site="ReplayPoker", analyze=True):
+        self._ocr_load_image(path)
+        if site and hasattr(self, "ocr_site_var"):
+            self.ocr_site_var.set(site)
+        if hasattr(self, "ocr_notes_var"):
+            self.ocr_notes_var.set(f"Live capture from {source}")
+        if hasattr(self, "ocr_capture_status_var"):
+            self.ocr_capture_status_var.set(f"Capture: image loaded from {source}")
+        self._set_status(f"OCR capture loaded from {source}")
+        if analyze:
+            self._ocr_analyze()
+
+    def _ocr_process_text_capture(self, text, source="bridge-text", site="ReplayPoker"):
+        if hasattr(self, "ocr_site_var"):
+            self.ocr_site_var.set(site)
+        if hasattr(self, "ocr_notes_var"):
+            self.ocr_notes_var.set(f"Bridge text capture from {source}")
+        self._ocr_current_path = None
+        self._ocr_current_raw_text = text
+        elements = self.ocr_engine.parse_poker_elements(text)
+        analysis = self.ocr_engine.format_analysis(elements)
+        self._ocr_show_result(analysis, elements, text)
+        if hasattr(self, "ocr_capture_status_var"):
+            self.ocr_capture_status_var.set(f"Capture: bridge text received from {source}")
+        self._set_status(f"Bridge text capture processed from {source}")
+
+    def _start_ocr_capture_bridge(self):
+        started = self.capture_bridge.start()
+        if hasattr(self, "ocr_bridge_status_var"):
+            if started:
+                self.ocr_bridge_status_var.set(
+                    f"Bridge: {self.capture_bridge.capture_text_url} | {self.capture_bridge.capture_image_url}"
+                )
+            else:
+                self.ocr_bridge_status_var.set("Bridge: failed to start")
+        return started
+
+    def _stop_ocr_capture_bridge(self):
+        self.capture_bridge.stop()
+        if hasattr(self, "ocr_bridge_status_var"):
+            self.ocr_bridge_status_var.set("Bridge: stopped")
+        self._set_status("OCR bridge stopped")
+
+    def _schedule_ocr_bridge_poll(self):
+        if self._capture_poll_job is not None:
+            try:
+                self.after_cancel(self._capture_poll_job)
+            except Exception:
+                pass
+        self._capture_poll_job = self.after(800, self._poll_ocr_bridge)
+
+    def _poll_ocr_bridge(self):
+        payload = self.capture_bridge.get_capture()
+        while payload:
+            if payload.get("type") == "image":
+                self._ocr_process_image_capture(
+                    payload["path"],
+                    source=payload.get("source", "bridge-image"),
+                    site=payload.get("site", "ReplayPoker"),
+                    analyze=True,
+                )
+            elif payload.get("type") == "text":
+                self._ocr_process_text_capture(
+                    payload.get("text", ""),
+                    source=payload.get("source", "bridge-text"),
+                    site=payload.get("site", "ReplayPoker"),
+                )
+            payload = self.capture_bridge.get_capture()
+        self._schedule_ocr_bridge_poll()
+
+    def _start_ocr_hotkeys(self):
+        if not HAS_WIN32:
+            if hasattr(self, "ocr_hotkeys_status_var"):
+                self.ocr_hotkeys_status_var.set("Hotkeys: unavailable (pywin32 missing)")
+            return
+
+        def _listen():
+            try:
+                import ctypes
+                import ctypes.wintypes
+
+                WM_HOTKEY = 0x0312
+                MOD_CONTROL = 0x0002
+                MOD_SHIFT = 0x0004
+                registrations = {
+                    2101: (MOD_CONTROL | MOD_SHIFT, 0x52, lambda: self._ocr_capture_replay_window(analyze=True)),
+                    2102: (MOD_CONTROL | MOD_SHIFT, 0x56, lambda: self._ocr_load_clipboard_image(analyze=True)),
+                }
+                registered = {}
+                for hotkey_id, (mods, vk, callback) in registrations.items():
+                    if ctypes.windll.user32.RegisterHotKey(None, hotkey_id, mods, vk):
+                        registered[hotkey_id] = callback
+
+                if hasattr(self, "ocr_hotkeys_status_var"):
+                    if registered:
+                        self.after(
+                            0,
+                            lambda: self.ocr_hotkeys_status_var.set(
+                                "Hotkeys: Ctrl+Shift+R capture Replay window | Ctrl+Shift+V paste clipboard image"
+                            ),
+                        )
+                    else:
+                        self.after(
+                            0,
+                            lambda: self.ocr_hotkeys_status_var.set("Hotkeys: unavailable (registration failed)"),
+                        )
+
+                msg = ctypes.wintypes.MSG()
+                while registered:
+                    ret = ctypes.windll.user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                    if ret <= 0:
+                        break
+                    if msg.message == WM_HOTKEY and msg.wParam in registered:
+                        self.after(0, registered[msg.wParam])
+                    ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
+                    ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+            except Exception:
+                if hasattr(self, "ocr_hotkeys_status_var"):
+                    self.after(0, lambda: self.ocr_hotkeys_status_var.set("Hotkeys: unavailable"))
+
+        self._capture_hotkey_thread = threading.Thread(target=_listen, daemon=True)
+        self._capture_hotkey_thread.start()
+
+    def _on_app_close(self):
+        try:
+            if self._capture_poll_job is not None:
+                self.after_cancel(self._capture_poll_job)
+        except Exception:
+            pass
+        try:
+            self.capture_bridge.stop()
+        except Exception:
+            pass
+        self.destroy()
+
     def _build_ai_tab(self):
         tab = self.tab_ai
         t = self.theme
@@ -5722,21 +6339,21 @@ class PokerApp(ctk.CTk):
         ai_status_bar.pack(fill="x", padx=6, pady=(6, 2))
         self.ai_engine_status = ctk.CTkLabel(
             ai_status_bar,
-            text="\u2b22 AI Engine: checking...",
-            text_color=t["text_dim"], font=("Consolas", 10))
+            text="⬡ AI Engine: checking…",
+            text_color=t["text_dim"], font=_F_CAPTION)
         self.ai_engine_status.pack(side="left", padx=8, pady=4)
 
         # Provider selector
         self.ai_provider_var = ctk.StringVar(value="ollama")
         ctk.CTkLabel(ai_status_bar, text="Provider:", text_color=t["text_dim"],
-                     font=("Consolas", 10)).pack(side="right", padx=(8, 2), pady=4)
+                     font=_F_CAPTION).pack(side="right", padx=(8, 2), pady=4)
         ctk.CTkOptionMenu(
             ai_status_bar, variable=self.ai_provider_var,
             values=["ollama", "openai", "grok"],
             fg_color=t["bg_accent"], button_color=t["bg_hover"],
             text_color=t["text"], width=100, height=24,
             dropdown_fg_color=t["bg_card"], dropdown_hover_color=t["bg_accent"],
-            font=("Consolas", 10),
+            font=_F_CAPTION,
         ).pack(side="right", padx=(0, 8), pady=4)
 
         # ── Source selector ──
@@ -5745,7 +6362,7 @@ class PokerApp(ctk.CTk):
         src_frame.pack(fill="x", padx=6, pady=2)
 
         ctk.CTkLabel(src_frame, text="Analyze:", text_color=t["text"],
-                     font=("Consolas", 12)).pack(side="left", padx=(8, 4), pady=6)
+                     font=_F_BODY).pack(side="left", padx=(8, 4), pady=6)
         self.ai_source_var = ctk.StringVar(value="Filtered Hands")
         ctk.CTkOptionMenu(src_frame, variable=self.ai_source_var,
                           values=["All Hands", "Filtered Hands", "Selected Hands"],
@@ -5753,11 +6370,11 @@ class PokerApp(ctk.CTk):
                           text_color=t["text"], width=160,
                           dropdown_fg_color=t["bg_card"],
                           dropdown_hover_color=t["bg_accent"],
-                          font=("Consolas", 11)).pack(side="left", padx=4, pady=6)
+                          font=_F_BODY).pack(side="left", padx=4, pady=6)
 
         self.ai_filter_label = ctk.CTkLabel(src_frame, text="Filters: All Hands (no filters)",
                                              text_color=t["text_dim"],
-                                             font=("Consolas", 10))
+                                             font=_F_CAPTION_I)
         self.ai_filter_label.pack(side="left", padx=12, pady=6)
 
         # ── Action buttons — two groups ──
@@ -5792,7 +6409,7 @@ class PokerApp(ctk.CTk):
 
         # ── Output area (analysis results, top 60%) ──
         ai_text_box, self.ai_text = self._create_scroll_textbox(
-            tab, font=("Consolas", 11), wrap="none"
+            tab, font=_F_DATA_MD, wrap="none"
         )
         ai_text_box.pack(fill="both", expand=True, padx=6, pady=(4, 2))
 
@@ -5803,11 +6420,11 @@ class PokerApp(ctk.CTk):
         chat_frame.pack(fill="x", padx=6, pady=(2, 2))
 
         ctk.CTkLabel(chat_frame, text="🤖 Ask the Coach",
-                     text_color=t["gold"], font=("Consolas", 12, "bold")
+                     text_color=t["gold"], font=_F_LABEL
                      ).pack(anchor="w", padx=8, pady=(4, 2))
 
         chat_box_frame, self.ai_chat_display = self._create_scroll_textbox(
-            chat_frame, height=120, font=("Consolas", 10), wrap="word"
+            chat_frame, height=120, font=_F_DATA, wrap="word"
         )
         chat_box_frame.pack(fill="x", padx=6, pady=(0, 4))
 
@@ -5819,7 +6436,7 @@ class PokerApp(ctk.CTk):
             chat_input_row, textvariable=self.ai_chat_var,
             placeholder_text="Ask a poker strategy question…",
             fg_color=t["bg_input"], text_color=t["text"],
-            font=("Consolas", 11), height=32,
+            font=_F_BODY, height=32,
         )
         self._ai_chat_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self._ai_chat_entry.bind("<Return>", lambda e: self._send_chat())
@@ -5827,14 +6444,14 @@ class PokerApp(ctk.CTk):
         ctk.CTkButton(
             chat_input_row, text="Send", width=70, height=32,
             fg_color=t["bg_accent"], hover_color=t["bg_hover"],
-            text_color=t["gold"], font=("Consolas", 11, "bold"),
+            text_color=t["gold"], font=_F_DATA_BOLD,
             command=self._send_chat,
         ).pack(side="left")
 
         ctk.CTkButton(
             chat_input_row, text="Clear", width=60, height=32,
             fg_color=t["bg_card"], hover_color=t["bg_hover"],
-            text_color=t["text_dim"], font=("Consolas", 10),
+            text_color=t["text_dim"], font=_F_DATA,
             command=self._clear_chat,
         ).pack(side="left", padx=(4, 0))
 
@@ -5845,11 +6462,11 @@ class PokerApp(ctk.CTk):
         ai_footer.pack_propagate(False)
         self.ai_footer_label = ctk.CTkLabel(
             ai_footer, text="Ready", text_color=t["text_dim"],
-            font=("Consolas", 9), anchor="w")
+            font=_F_CAPTION, anchor="w")
         self.ai_footer_label.pack(side="left", padx=8)
         self.ai_vector_label = ctk.CTkLabel(
             ai_footer, text="", text_color=t["text_dim"],
-            font=("Consolas", 9), anchor="e")
+            font=_F_CAPTION, anchor="e")
         self.ai_vector_label.pack(side="right", padx=8)
 
         # Update AI status after build
@@ -5861,10 +6478,11 @@ class PokerApp(ctk.CTk):
 
         # ── API Keys ──────────────────────────────────────────────────────────
         api_frame = ctk.CTkFrame(tab, fg_color=t["bg_panel"],
+                                  corner_radius=10,
                                   border_width=1, border_color=t["border"])
         api_frame.pack(fill="x", padx=6, pady=6)
         ctk.CTkLabel(api_frame, text="🔑 AI API Keys", text_color=t["gold"],
-                     font=("Consolas", 14, "bold")).pack(anchor="w", padx=8, pady=4)
+                     font=_F_TITLE).pack(anchor="w", padx=8, pady=4)
 
         oai_row = ctk.CTkFrame(api_frame, fg_color=t["bg_panel"])
         oai_row.pack(fill="x", padx=8, pady=2)
@@ -5877,15 +6495,14 @@ class PokerApp(ctk.CTk):
             fg_color=t["bg_input"], text_color=t["text"],
             show="*", width=340, placeholder_text="sk-...")
         oai_entry.pack(side="left", padx=4)
-        ctk.CTkButton(oai_row, text="Show/Hide", width=80, height=28,
-                      fg_color=t["bg_card"], hover_color=t["bg_hover"],
-                      text_color=t["text_dim"], font=("Consolas", 10),
-                      command=lambda: oai_entry.configure(
-                          show="" if oai_entry.cget("show") == "*" else "*")
-                      ).pack(side="left", padx=4)
+        self._action_button(
+            oai_row, "Show/Hide",
+            lambda: oai_entry.configure(show="" if oai_entry.cget("show") == "*" else "*"),
+            tone="neutral", width=80, height=28,
+        ).pack(side="left", padx=4)
         ctk.CTkLabel(oai_row, text="gpt-4o-mini / gpt-4o",
                      text_color=t["text_dim"],
-                     font=("Consolas", 9)).pack(side="left", padx=8)
+                     font=_F_CAPTION).pack(side="left", padx=8)
 
         ant_row = ctk.CTkFrame(api_frame, fg_color=t["bg_panel"])
         ant_row.pack(fill="x", padx=8, pady=(2, 6))
@@ -5899,13 +6516,14 @@ class PokerApp(ctk.CTk):
                      placeholder_text="sk-ant-... (optional)").pack(side="left", padx=4)
         ctk.CTkLabel(ant_row, text="Claude fallback (optional)",
                      text_color=t["text_dim"],
-                     font=("Consolas", 9)).pack(side="left", padx=8)
+                     font=_F_CAPTION).pack(side="left", padx=8)
 
         hero_frame = ctk.CTkFrame(tab, fg_color=self.theme["bg_panel"],
+                                   corner_radius=10,
                                    border_width=1, border_color=self.theme["border"])
         hero_frame.pack(fill="x", padx=6, pady=6)
         ctk.CTkLabel(hero_frame, text="Hero Names", text_color=self.theme["gold"],
-                     font=("Consolas", 14, "bold")).pack(anchor="w", padx=8, pady=4)
+                     font=_F_TITLE).pack(anchor="w", padx=8, pady=4)
 
         row1 = ctk.CTkFrame(hero_frame, fg_color=self.theme["bg_panel"])
         row1.pack(fill="x", padx=8, pady=2)
@@ -5921,7 +6539,7 @@ class PokerApp(ctk.CTk):
         ctk.CTkEntry(row2, textvariable=self.hero_bacr_var, fg_color=self.theme["bg_input"],
                      text_color=self.theme["text"], width=200).pack(side="left", padx=4)
         ctk.CTkLabel(row2, text="(WPN/ACR skin)", text_color=self.theme["text_dim"],
-                     font=("Consolas", 10)).pack(side="left", padx=8)
+                     font=_F_DATA).pack(side="left", padx=8)
 
         row3 = ctk.CTkFrame(hero_frame, fg_color=self.theme["bg_panel"])
         row3.pack(fill="x", padx=8, pady=2)
@@ -5930,14 +6548,24 @@ class PokerApp(ctk.CTk):
         ctk.CTkEntry(row3, textvariable=self.hero_gg_var, fg_color=self.theme["bg_input"],
                      text_color=self.theme["text"], width=200).pack(side="left", padx=4)
 
+        row4 = ctk.CTkFrame(hero_frame, fg_color=self.theme["bg_panel"])
+        row4.pack(fill="x", padx=8, pady=2)
+        ctk.CTkLabel(row4, text="ReplayPoker:", text_color=self.theme["text"], width=100).pack(side="left")
+        self.hero_rp_var = ctk.StringVar(value=self.settings["hero_names"].get("ReplayPoker", ""))
+        ctk.CTkEntry(row4, textvariable=self.hero_rp_var, fg_color=self.theme["bg_input"],
+                     text_color=self.theme["text"], width=200).pack(side="left", padx=4)
+        ctk.CTkLabel(row4, text="(casino.org)", text_color=self.theme["text_dim"],
+                     font=_F_DATA).pack(side="left", padx=8)
+
         dir_frame = ctk.CTkFrame(tab, fg_color=self.theme["bg_panel"],
+                                  corner_radius=10,
                                   border_width=1, border_color=self.theme["border"])
         dir_frame.pack(fill="both", expand=True, padx=6, pady=4)
         ctk.CTkLabel(dir_frame, text="Scan Directories", text_color=self.theme["gold"],
-                     font=("Consolas", 14, "bold")).pack(anchor="w", padx=8, pady=4)
+                     font=_F_TITLE).pack(anchor="w", padx=8, pady=4)
 
         dir_list_box, self.dir_listbox = self._create_scroll_textbox(
-            dir_frame, height=120, font=("Consolas", 11), wrap="none"
+            dir_frame, height=120, font=_F_DATA_MD, wrap="none"
         )
         dir_list_box.pack(fill="both", expand=True, padx=8, pady=4)
         self._refresh_dir_list()
@@ -5948,24 +6576,22 @@ class PokerApp(ctk.CTk):
         self.new_dir_var = ctk.StringVar()
         ctk.CTkEntry(dir_btn_row, textvariable=self.new_dir_var, fg_color=self.theme["bg_input"],
                      text_color=self.theme["text"], width=280).pack(side="left", padx=4)
-        ctk.CTkButton(dir_btn_row, text="Browse...", fg_color=self.theme["bg_accent"],
-                      hover_color=self.theme["green"],
-                      text_color=self.theme["text"], width=80, command=self._browse_dir).pack(side="left", padx=2)
+        self._action_button(dir_btn_row, "Browse...", self._browse_dir,
+                            tone="neutral", width=80).pack(side="left", padx=2)
         ctk.CTkLabel(dir_btn_row, text="Site:", text_color=self.theme["text"]).pack(side="left", padx=(8, 0))
         self.new_dir_site_var = ctk.StringVar(value="CoinPoker")
         ctk.CTkOptionMenu(dir_btn_row, variable=self.new_dir_site_var,
-                          values=["CoinPoker", "BetACR", "GGPoker"], fg_color=self.theme["bg_accent"],
+                          values=["CoinPoker", "BetACR", "GGPoker", "ReplayPoker"], fg_color=self.theme["bg_accent"],
                           button_color=self.theme["bg_hover"], text_color=self.theme["text"],
                           dropdown_fg_color=self.theme["bg_card"],
                           dropdown_hover_color=self.theme["bg_accent"]).pack(side="left", padx=4)
-        ctk.CTkButton(dir_btn_row, text="Add", fg_color=self.theme["green"],
-                      hover_color=self.theme["bg_accent"],
-                      text_color=self.theme["bg_base"], width=60, command=self._add_dir).pack(side="left", padx=4)
-        ctk.CTkButton(dir_btn_row, text="Remove Last", fg_color=self.theme["red"],
-                      hover_color=self.theme["bg_accent"],
-                      text_color=self.theme["text"], width=100, command=self._remove_dir).pack(side="left", padx=4)
+        self._action_button(dir_btn_row, "Add", self._add_dir,
+                            tone="success", width=60).pack(side="left", padx=4)
+        self._action_button(dir_btn_row, "Remove Last", self._remove_dir,
+                            tone="danger", width=100).pack(side="left", padx=4)
 
         opts_frame = ctk.CTkFrame(tab, fg_color=self.theme["bg_panel"],
+                                   corner_radius=10,
                                    border_width=1, border_color=self.theme["border"])
         opts_frame.pack(fill="x", padx=6, pady=4)
         self.auto_refresh_var = ctk.BooleanVar(value=self.settings.get("auto_refresh", True))
@@ -5978,18 +6604,17 @@ class PokerApp(ctk.CTk):
         ctk.CTkEntry(opts_frame, textvariable=self.interval_var, fg_color=self.theme["bg_input"],
                      text_color=self.theme["text"], width=60).pack(side="left", padx=4)
 
-        ctk.CTkButton(opts_frame, text="Save Settings", fg_color=self.theme["green"],
-                      hover_color=self.theme["bg_accent"],
-                      text_color=self.theme["bg_base"], font=("Consolas", 13, "bold"),
-                      command=self._save_settings).pack(side="right", padx=8, pady=6)
+        self._action_button(opts_frame, "Save Settings", self._save_settings,
+                            tone="success", width=130, bold=True).pack(side="right", padx=8, pady=6)
 
         # ── Appearance / Theme Section ────────────────────────────────────
         theme_frame = ctk.CTkFrame(tab, fg_color=self.theme["bg_panel"],
+                                    corner_radius=10,
                                     border_width=1, border_color=self.theme["border"])
         theme_frame.pack(fill="x", padx=6, pady=4)
 
         ctk.CTkLabel(theme_frame, text="Appearance", text_color=self.theme["gold"],
-                     font=("Consolas", 14, "bold")).pack(anchor="w", padx=8, pady=4)
+                     font=_F_TITLE).pack(anchor="w", padx=8, pady=4)
 
         theme_row = ctk.CTkFrame(theme_frame, fg_color=self.theme["bg_panel"])
         theme_row.pack(fill="x", padx=8, pady=4)
@@ -6017,10 +6642,11 @@ class PokerApp(ctk.CTk):
 
         # ── Live HUD Settings ─────────────────────────────────────────────
         hud_frame = ctk.CTkFrame(tab, fg_color=self.theme["bg_panel"],
+                                  corner_radius=10,
                                   border_width=1, border_color=self.theme["border"])
         hud_frame.pack(fill="x", padx=6, pady=6)
         ctk.CTkLabel(hud_frame, text="⬡ Live HUD Overlay", text_color=self.theme["gold"],
-                     font=("Consolas", 14, "bold")).pack(anchor="w", padx=8, pady=4)
+                     font=_F_TITLE).pack(anchor="w", padx=8, pady=4)
 
         hud_row1 = ctk.CTkFrame(hud_frame, fg_color=self.theme["bg_panel"])
         hud_row1.pack(fill="x", padx=8, pady=2)
@@ -6043,7 +6669,7 @@ class PokerApp(ctk.CTk):
             lambda *_: self.hud_opacity_label_var.set(f"{self.hud_opacity_var.get():.2f}"),
         )
         ctk.CTkLabel(hud_row2, textvariable=self.hud_opacity_label_var, text_color=self.theme["text_dim"],
-                     font=("Consolas", 10), width=40).pack(side="left")
+                     font=_F_DATA, width=40).pack(side="left")
 
         hud_row3 = ctk.CTkFrame(hud_frame, fg_color=self.theme["bg_panel"])
         hud_row3.pack(fill="x", padx=8, pady=2)
@@ -6096,7 +6722,7 @@ class PokerApp(ctk.CTk):
             hud_frame,
             text="Site preset can reposition the summary card and shift all badges by poker client. Manual offset applies on top.",
             text_color=self.theme["text_dim"],
-            font=("Consolas", 10),
+            font=_F_DATA,
         ).pack(anchor="w", padx=10, pady=(2, 4))
 
         hud_profile_row = ctk.CTkFrame(hud_frame, fg_color=self.theme["bg_panel"])
@@ -6121,40 +6747,34 @@ class PokerApp(ctk.CTk):
             hud_frame,
             text="No site profile loaded",
             text_color=self.theme["text_dim"],
-            font=("Consolas", 10),
+            font=_F_DATA,
         )
         self.hud_profile_status.pack(anchor="w", padx=10, pady=(0, 4))
 
         if not HAS_WIN32:
             ctk.CTkLabel(hud_frame, text="⚠ pywin32 not installed — run: pip install pywin32",
-                         text_color=self.theme["red"], font=("Consolas", 10)).pack(anchor="w", padx=8, pady=(0, 4))
+                         text_color=self.theme["red"], font=_F_DATA).pack(anchor="w", padx=8, pady=(0, 4))
 
     def _build_status_bar(self):
-        self.taskbar = ctk.CTkFrame(self, fg_color=self.theme["bg_panel"], height=42, corner_radius=0)
+        self.taskbar = ctk.CTkFrame(self, fg_color=self.theme["bg_panel"], height=34, corner_radius=0)
         self.taskbar.pack(fill="x", side="bottom", padx=0, pady=0)
         self.taskbar.pack_propagate(False)
-        top_glow = tk.Frame(self.taskbar, bg=self.theme["bg_panel"], height=2)
-        top_glow.pack(fill="x", side="top")
-        for color in (
-            _lighten(self.theme["border_hl"], 0.22),
-            _blend(self.theme["border_hl"], self.theme["gold"], 0.32),
-            _blend(self.theme["bg_accent"], self.theme["border_hl"], 0.62),
-            _darken(self.theme["bg_accent"], 0.05),
-        ):
-            tk.Frame(top_glow, bg=color, width=10).pack(side="left", fill="both", expand=True)
+        # Single top accent line — replaces the multi-color glow
+        tk.Frame(self.taskbar, bg=_blend(self.theme["border_hl"], self.theme["gold"], 0.28),
+                 height=1).pack(fill="x", side="top")
 
-        self._action_button(self.taskbar, "Import", self._manual_import, width=96, bold=True).pack(side="left", padx=(8, 4), pady=5)
-        self._action_button(self.taskbar, "Reload", self._manual_refresh, width=88).pack(side="left", padx=4, pady=5)
+        self._action_button(self.taskbar, "Import", self._manual_import, width=80, bold=True).pack(side="left", padx=(8, 3), pady=3)
+        self._action_button(self.taskbar, "Reload", self._manual_refresh, width=72).pack(side="left", padx=3, pady=3)
 
         self.live_hud_btn = self._action_button(
-            self.taskbar, "⬡ Live HUD", self._toggle_live_hud, tone="neutral", width=100
+            self.taskbar, "⬡ Live HUD", self._toggle_live_hud, tone="neutral", width=90
         )
-        self.live_hud_btn.pack(side="left", padx=4, pady=5)
+        self.live_hud_btn.pack(side="left", padx=3, pady=3)
 
         self.hud_layout_btn = self._action_button(
-            self.taskbar, "Layout Mode", self._toggle_hud_layout_mode, tone="accent", width=110
+            self.taskbar, "Layout Mode", self._toggle_hud_layout_mode, tone="accent", width=100
         )
-        self.hud_layout_btn.pack(side="left", padx=4, pady=5)
+        self.hud_layout_btn.pack(side="left", padx=3, pady=3)
 
         self.adv_mode_var = ctk.BooleanVar(value=self.advanced_mode)
         ctk.CTkSwitch(
@@ -6164,35 +6784,14 @@ class PokerApp(ctk.CTk):
             fg_color=self.theme["border"],
             progress_color=self.theme["gold"],
             text_color=self.theme["text_dim"],
-            font=("Consolas", 11),
+            font=_F_CAPTION,
             command=self._toggle_advanced_mode,
-        ).pack(side="left", padx=8, pady=5)
+        ).pack(side="left", padx=8, pady=3)
 
-        self.taskbar_hint_shell = ctk.CTkFrame(
-            self.taskbar,
-            fg_color=self.theme["bg_card"],
-            corner_radius=12,
-            border_width=1,
-            border_color=_blend(self.theme["border_hl"], self.theme["gold"], 0.26),
-        )
-        self.taskbar_hint_shell.pack(side="left", padx=(6, 10), pady=5)
-        self.taskbar_hint = ctk.CTkLabel(
-            self.taskbar_hint_shell,
-            text="CONTROL SURFACE  •  IMPORT  •  SYNC  •  HUD",
-            text_color=self.theme["text_dim"],
-            fg_color="transparent",
-            padx=10,
-            pady=4,
-            font=ctk.CTkFont(
-                family="Consolas",
-                size=11,
-                weight="bold",
-            ),
-        )
-        self.taskbar_hint.pack()
-
-        self.status_bar = ctk.CTkLabel(self.taskbar, text="Starting...", text_color=self.theme["text_dim"], font=("Consolas", 11), anchor="e")
-        self.status_bar.pack(side="right", fill="x", expand=True, padx=10)
+        self.status_bar = ctk.CTkLabel(
+            self.taskbar, text="Starting…", text_color=self.theme["text_dim"],
+            font=_F_CAPTION, anchor="e")
+        self.status_bar.pack(side="right", fill="x", expand=True, padx=8)
 
         self.theme_var = ctk.StringVar(value=self.theme_name)
         ctk.CTkOptionMenu(
@@ -6202,91 +6801,79 @@ class PokerApp(ctk.CTk):
             fg_color=self.theme["bg_accent"],
             button_color=self.theme["bg_hover"],
             text_color=self.theme["text"],
-            width=120,
-            height=28,
-            font=("Consolas", 11),
+            width=110,
+            height=24,
+            font=_F_CAPTION,
             dropdown_fg_color=self.theme["bg_card"],
             dropdown_hover_color=self.theme["bg_accent"],
             command=self._change_theme,
-        ).pack(side="right", padx=(4, 8), pady=5)
-        ctk.CTkLabel(self.taskbar, text="Theme:", text_color=self.theme["text_dim"], font=("Consolas", 11)).pack(side="right", padx=(8, 0), pady=5)
+        ).pack(side="right", padx=(3, 6), pady=3)
+        ctk.CTkLabel(self.taskbar, text="Theme:", text_color=self.theme["text_dim"],
+                     font=_F_CAPTION).pack(side="right", padx=(6, 0), pady=3)
 
     def _build_header_bar(self):
         t = self.theme
-        header = tk.Frame(self, bg=_darken(t["bg_panel"], 0.06), height=62)
+        header = tk.Frame(self, bg=t["bg_panel"], height=46)
         header.pack(fill="x", side="top", before=self.tabview)
         header.pack_propagate(False)
-        top_glow = tk.Frame(header, bg=t["bg_panel"], height=2)
-        top_glow.pack(fill="x", side="top")
-        for color in (
-            _blend(t["bg_panel"], t["border_hl"], 0.25),
-            _blend(t["border_hl"], t["gold"], 0.24),
-            _blend(t["bg_accent"], t["border_hl"], 0.58),
-            _darken(t["bg_accent"], 0.06),
-        ):
-            tk.Frame(top_glow, bg=color, width=10).pack(side="left", fill="both", expand=True)
-        # Bottom glow line
-        bottom_glow = tk.Frame(header, bg=t["bg_panel"], height=2)
-        bottom_glow.pack(fill="x", side="bottom")
-        for color in (
-            _lighten(t["border_hl"], 0.18),
-            _blend(t["border_hl"], t["gold"], 0.3),
-            _blend(t["bg_accent"], t["border_hl"], 0.6),
-            _darken(t["bg_accent"], 0.04),
-        ):
-            tk.Frame(bottom_glow, bg=color, width=10).pack(side="left", fill="both", expand=True)
+        # Single bottom accent line — clean, not cluttered
+        tk.Frame(header, bg=_blend(t["border_hl"], t["gold"], 0.35), height=1).pack(
+            fill="x", side="bottom")
+
         left = tk.Frame(header, bg=t["bg_panel"])
-        left.pack(side="left", fill="y", padx=(14, 0), pady=7)
-        suits_row = tk.Frame(left, bg=t["bg_panel"])
-        suits_row.pack(anchor="w")
+        left.pack(side="left", fill="y", padx=(14, 0), pady=0)
+
+        title_row = tk.Frame(left, bg=t["bg_panel"])
+        title_row.pack(anchor="w", fill="y", expand=True)
+
+        # Suit symbols — compact row
         for sym, col in [("♠", t["text"]), ("♥", t["red"]), ("♦", t["gold"]), ("♣", t["green"])]:
-            tk.Label(suits_row, text=sym, bg=t["bg_panel"], fg=col,
-                     font=("Segoe UI Symbol", 16, "bold")).pack(side="left", padx=2)
-        title_shell = tk.Frame(left, bg=t["bg_panel"], highlightthickness=1,
-                               highlightbackground=_blend(t["border_hl"], t["gold"], 0.24))
-        title_shell.pack(anchor="w", pady=(2, 0))
-        tk.Label(
-            title_shell,
-            text="POKER TRACKER",
-            bg=_blend(t["bg_panel"], t["bg_card"], 0.45),
-            fg=t.get("text_header", t["text"]),
-            font=("Consolas", 15, "bold"),
-            padx=10,
-            pady=3,
-        ).pack(anchor="w")
-        tk.Label(
-            left,
-            text="Slate command surface for import, review, and live HUD control",
-            bg=t["bg_panel"],
-            fg=t["text_dim"],
-            font=("Consolas", 11),
-        ).pack(anchor="w")
+            tk.Label(title_row, text=sym, bg=t["bg_panel"], fg=col,
+                     font=("Segoe UI Symbol", 13)).pack(side="left", padx=1)
+
+        tk.Frame(title_row, bg=_blend(t["border_hl"], t["gold"], 0.3),
+                 width=1).pack(side="left", fill="y", padx=(6, 8), pady=8)
+
+        # App name — Segoe UI, bold
+        tk.Label(title_row, text="LEAKSNIPE",
+                 bg=t["bg_panel"], fg=t.get("text_header", t["text"]),
+                 font=_F_HEADER).pack(side="left")
+
+        # Italic subtitle next to name
+        self._header_subtitle = tk.Label(
+            title_row,
+            text=" — import · review · HUD",
+            bg=t["bg_panel"], fg=t["text_dim"],
+            font=_F_BODY_I,
+            anchor="w",
+        )
+        self._header_subtitle.pack(side="left", padx=(4, 0))
 
         right = tk.Frame(header, bg=t["bg_panel"])
-        right.pack(side="right", padx=14, pady=10)
+        right.pack(side="right", padx=12, fill="y")
 
-        def _header_badge(parent, text, fg, text_color):
-            badge_shadow = tk.Frame(parent, bg=_darken(t["bg_base"], 0.72))
-            badge_shadow.pack(side="right", padx=(8, 0), pady=(1, 3))
-            badge = tk.Frame(
-                badge_shadow,
-                bg=fg,
-                padx=10,
-                pady=4,
-                highlightthickness=1,
-                highlightbackground=_blend(text_color, t["gold"], 0.22),
-            )
-            badge.pack(fill="both", expand=True, padx=(0, 2), pady=(0, 2))
-            tk.Label(
-                badge,
-                text=text,
-                bg=fg,
-                fg=text_color,
-                font=("Consolas", 11, "bold"),
-            ).pack()
+        # Compact HUD badge — just a pill, no shadow box
+        hud_pill = tk.Frame(right, bg=t["bg_accent"],
+                            highlightthickness=1,
+                            highlightbackground=_blend(t["border_hl"], t["gold"], 0.3))
+        hud_pill.pack(side="right", padx=(6, 0), pady=10)
+        tk.Label(hud_pill, text="⬡ HUD READY",
+                 bg=t["bg_accent"], fg=t["text"],
+                 font=_F_CAPTION, padx=8, pady=2).pack()
 
-        _header_badge(right, self.theme_name.upper(), t["bg_card"], t["text"])
-        _header_badge(right, "LIVE HUD READY", t["bg_accent"], t["text"])
+        # Theme name pill
+        theme_pill = tk.Frame(right, bg=t["bg_card"],
+                              highlightthickness=1,
+                              highlightbackground=t["border"])
+        theme_pill.pack(side="right", pady=10)
+        tk.Label(theme_pill, text=self.theme_name.upper(),
+                 bg=t["bg_card"], fg=t["text_dim"],
+                 font=_F_CAPTION, padx=6, pady=2).pack()
+
+        def _header_configure(event):
+            avail = max(80, event.width - right.winfo_reqwidth() - 60)
+            self._header_subtitle.configure(wraplength=avail)
+        header.bind("<Configure>", _header_configure, add="+")
 
     def _toggle_advanced_mode(self):
         self.advanced_mode = self.adv_mode_var.get()
@@ -6739,109 +7326,216 @@ class PokerApp(ctk.CTk):
             return
         self._open_tag_dialog(selected)
 
-    def _open_tag_dialog(self, hands):
-        """Popup to add/remove tags on given hands."""
-        dialog = ctk.CTkToplevel(self)
+    def _open_tag_dialog(self, hands, parent=None):
+        """Visual tag dialog — color-coded toggle buttons grouped by category."""
+        logging.debug("Opening tag dialog for %d hand(s); parent=%s", len(hands), type(parent).__name__ if parent is not None else "self")
+        owner = parent if parent is not None else self
+        dialog = tk.Toplevel(owner)
         dialog.title("Tag Hands")
-        dialog.geometry("380x320")
-        dialog.configure(fg_color=self.theme["bg_base"])
-        dialog.transient(self)
-        dialog.grab_set()
+        dialog.geometry("520x420")
+        dialog.configure(bg=self.theme["bg_base"])
+        dialog.transient(owner)
+        dialog.lift()
+        dialog.focus_force()
+        if owner is not self:
+            dialog.attributes("-topmost", True)
+            dialog.after(150, lambda: dialog.wm_attributes("-topmost", False))
+        t = self.theme
 
-        ctk.CTkLabel(dialog, text=f"Tag {len(hands)} hand(s)",
-                     text_color=self.theme["gold"], font=("Consolas", 14, "bold")
-                     ).pack(pady=(12, 4))
+        # Header
+        hdr = tk.Frame(dialog, bg=t["bg_accent"], height=36)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        count_word = f"{len(hands)} hand" if len(hands) == 1 else f"{len(hands)} hands"
+        tk.Label(hdr, text=f"🏷  Tag  {count_word}", bg=t["bg_accent"], fg=t["text"],
+                 font=_F_LABEL).pack(side="left", padx=10, pady=6)
 
-        # Existing tags on these hands
+        # Current tags pill row
         all_tags_on = set()
         for h in hands:
-            for t in self.db.get_tags(h.hand_id):
-                all_tags_on.add(t)
+            for tag in self.db.get_tags(h.hand_id):
+                all_tags_on.add(tag)
 
-        if all_tags_on:
-            ctk.CTkLabel(dialog, text="Current tags: " + ", ".join(sorted(all_tags_on)),
-                         text_color=self.theme["text_dim"], font=("Consolas", 10)
-                         ).pack(padx=12, pady=2)
+        pill_frame = tk.Frame(dialog, bg=t["bg_panel"])
+        pill_frame.pack(fill="x", padx=12, pady=(8, 0))
+        tk.Label(pill_frame, text="Active tags:", bg=t["bg_panel"], fg=t["text_dim"],
+                 font=_F_CAPTION).pack(side="left", padx=(0, 6))
+        self._tag_dialog_pill_frame = pill_frame
+        self._tag_dialog_hands = hands
+        self._tag_dialog_active = all_tags_on
 
-        # Preset tag buttons
-        preset_frame = ctk.CTkFrame(dialog, fg_color=self.theme["bg_panel"])
-        preset_frame.pack(fill="x", padx=12, pady=6)
-        ctk.CTkLabel(preset_frame, text="Quick Tags:", text_color=self.theme["text_dim"],
-                     font=("Consolas", 10)).pack(anchor="w", padx=4, pady=2)
+        def _rebuild_pills():
+            for w in pill_frame.winfo_children()[1:]:
+                w.destroy()
+            cur = set()
+            for h in hands:
+                for tag in self.db.get_tags(h.hand_id):
+                    cur.add(tag)
+            if not cur:
+                tk.Label(pill_frame, text="none", bg=t["bg_panel"], fg=t["text_dim"],
+                         font=_F_CAPTION_I).pack(side="left")
+            else:
+                for tag in sorted(cur):
+                    col = HAND_TAG_COLORS.get(tag, t["border_hl"])
+                    pf = tk.Frame(pill_frame, bg=col, padx=1, pady=1)
+                    pf.pack(side="left", padx=2)
+                    tk.Label(pf, text=tag, bg=col, fg="#111111",
+                             font=(_FF, 9, "bold"), padx=6, pady=1).pack()
 
-        presets_row = ctk.CTkFrame(preset_frame, fg_color=self.theme["bg_panel"])
-        presets_row.pack(fill="x", padx=4, pady=2)
-        preset_tags = ["Review", "Bluff", "Bad Beat", "Key Hand", "Cooler",
-                       "Misplay", "Hero Call", "Big Pot", "Tournament"]
-        for ptag in preset_tags:
-            ctk.CTkButton(presets_row, text=ptag, width=80, height=24,
-                          fg_color=self.theme["bg_card"], hover_color=self.theme["bg_accent"],
-                          text_color=self.theme["text"], font=("Consolas", 9),
-                          command=lambda t=ptag: _apply_tag(t)
-                          ).pack(side="left", padx=2, pady=2)
+        _rebuild_pills()
 
-        # Custom tag entry
-        entry_frame = ctk.CTkFrame(dialog, fg_color=self.theme["bg_panel"])
-        entry_frame.pack(fill="x", padx=12, pady=4)
-        ctk.CTkLabel(entry_frame, text="Custom Tag:", text_color=self.theme["text"],
-                     font=("Consolas", 11)).pack(side="left", padx=4)
-        tag_entry_var = ctk.StringVar()
-        tag_entry = ctk.CTkEntry(entry_frame, textvariable=tag_entry_var,
-                                  fg_color=self.theme["bg_input"], text_color=self.theme["text"],
-                                  width=160, font=("Consolas", 11))
+        # Preset area (plain tkinter to avoid CTk/Tk popup issues)
+        preset_container = tk.Frame(dialog, bg=t["bg_panel"])
+        preset_container.pack(fill="both", expand=True, padx=12, pady=6)
+
+        # Group by category
+        from collections import OrderedDict
+        categories = OrderedDict()
+        for entry in HAND_TAG_PRESETS:
+            label, key, color, cat = entry
+            categories.setdefault(cat, []).append(entry)
+
+        CAT_ICONS = {"Review": "📋", "Decision": "🎯", "Situation": "💥",
+                     "Mistake": "❌", "Other": "🔧"}
+
+        for cat, entries in categories.items():
+            cat_row = tk.Frame(preset_container, bg=t["bg_panel"])
+            cat_row.pack(fill="x", pady=(8, 2))
+            tk.Label(cat_row, text=f"{CAT_ICONS.get(cat,'•')} {cat}",
+                     bg=t["bg_panel"], fg=t["text_dim"],
+                     font=_F_CAPTION_I).pack(side="left", padx=4)
+            tk.Frame(cat_row, bg=t["border"], height=1).pack(
+                side="left", fill="x", expand=True, padx=(6, 0), pady=6)
+
+            btns_row = tk.Frame(preset_container, bg=t["bg_panel"])
+            btns_row.pack(fill="x", padx=4, pady=2)
+
+            for entry in entries:
+                lbl_text, key, color, _cat = entry
+
+                def _make_btn(k=key, c=color, display=lbl_text):
+                    cur_active = any(k in self.db.get_tags(h.hand_id) for h in hands)
+                    bg_on  = c
+                    bg_off = _blend(c, t["bg_panel"], 0.80)
+                    fg_on  = "#111111"
+                    fg_off = _lighten(c, 0.3)
+                    bf = tk.Frame(btns_row, bg=_blend(c, t["bg_panel"], 0.5), padx=1, pady=1)
+                    bf.pack(side="left", padx=3, pady=3)
+                    btn = tk.Button(
+                        bf, text=display,
+                        bg=bg_on if cur_active else bg_off,
+                        fg=fg_on if cur_active else fg_off,
+                        activebackground=bg_on,
+                        activeforeground=fg_on,
+                        font=(_FF, 10, "bold") if cur_active else (_FF, 10, "normal"),
+                        relief="flat", bd=0, padx=10, pady=4, cursor="hand2",
+                    )
+                    btn.pack()
+
+                    def _toggle(b=btn, bk=k, bc=c, bon=bg_on, boff=bg_off,
+                                bfon=fg_on, bfoff=fg_off):
+                        logging.debug("Toggling tag '%s' for %d hand(s)", bk, len(hands))
+                        currently = any(bk in self.db.get_tags(h.hand_id) for h in hands)
+                        if currently:
+                            for h in hands:
+                                self.db.remove_tag(h.hand_id, bk)
+                            b.configure(bg=boff, fg=bfoff, font=(_FF, 10, "normal"))
+                            status_lbl.configure(text=f"  Removed '{bk}' from {len(hands)} hand(s)", fg=t["text_dim"])
+                        else:
+                            for h in hands:
+                                self.db.add_tag(h.hand_id, bk)
+                            b.configure(bg=bon, fg=bfon, font=(_FF, 10, "bold"))
+                            status_lbl.configure(text=f"  ✓ Tagged {len(hands)} hand(s) with '{bk}'",
+                                                 fg=bc)
+                        _rebuild_pills()
+                        self._refresh_tag_filter()
+                    btn.configure(command=_toggle)
+
+                _make_btn()
+
+        # Custom tag row
+        custom_row = tk.Frame(dialog, bg=t["bg_panel"])
+        custom_row.pack(fill="x", padx=12, pady=(2, 4))
+        tk.Label(custom_row, text="Custom:", bg=t["bg_panel"], fg=t["text"],
+                 font=_F_BODY).pack(side="left", padx=(0, 6))
+        tag_entry_var = tk.StringVar()
+        tag_entry = tk.Entry(
+            custom_row,
+            textvariable=tag_entry_var,
+            bg=t["bg_input"],
+            fg=t["text"],
+            insertbackground=t["text"],
+            relief="flat",
+            bd=1,
+            width=22,
+            font=_F_BODY,
+        )
         tag_entry.pack(side="left", padx=4)
-        ctk.CTkButton(entry_frame, text="Add", fg_color=self.theme["green"],
-                      hover_color=self.theme["bg_accent"], text_color=self.theme["bg_base"],
-                      width=50, height=26, font=("Consolas", 11, "bold"),
-                      command=lambda: _apply_tag(tag_entry_var.get())
-                      ).pack(side="left", padx=4)
 
-        # Remove tag
-        remove_frame = ctk.CTkFrame(dialog, fg_color=self.theme["bg_panel"])
-        remove_frame.pack(fill="x", padx=12, pady=4)
-        ctk.CTkLabel(remove_frame, text="Remove Tag:", text_color=self.theme["text"],
-                     font=("Consolas", 11)).pack(side="left", padx=4)
-        existing_tags = sorted(all_tags_on) if all_tags_on else ["(none)"]
-        remove_var = ctk.StringVar(value=existing_tags[0])
-        ctk.CTkOptionMenu(remove_frame, variable=remove_var, values=existing_tags,
-                          fg_color=self.theme["bg_accent"], button_color=self.theme["bg_hover"],
-                          text_color=self.theme["text"], width=120,
-                          dropdown_fg_color=self.theme["bg_card"],
-                          dropdown_hover_color=self.theme["bg_accent"]
-                          ).pack(side="left", padx=4)
-        ctk.CTkButton(remove_frame, text="Remove", fg_color=self.theme["red"],
-                      hover_color=self.theme["bg_accent"], text_color=self.theme["text"],
-                      width=70, height=26, font=("Consolas", 11),
-                      command=lambda: _remove_tag(remove_var.get())
-                      ).pack(side="left", padx=4)
-
-        # Status label
-        status_lbl = ctk.CTkLabel(dialog, text="", text_color=self.theme["green"],
-                                   font=("Consolas", 11))
-        status_lbl.pack(pady=4)
-
-        def _apply_tag(tag):
-            tag = tag.strip()
+        def _add_custom():
+            tag = tag_entry_var.get().strip()
             if not tag:
                 return
+            logging.debug("Adding custom tag '%s' for %d hand(s)", tag, len(hands))
             for h in hands:
                 self.db.add_tag(h.hand_id, tag)
-            status_lbl.configure(text=f"✓ Tagged {len(hands)} hands with '{tag}'")
+            status_lbl.configure(text=f"  ✓ Added '{tag}'", fg=t["green"])
+            tag_entry_var.set("")
+            _rebuild_pills()
             self._refresh_tag_filter()
 
-        def _remove_tag(tag):
-            tag = tag.strip()
-            if not tag or tag == "(none)":
-                return
-            for h in hands:
-                self.db.remove_tag(h.hand_id, tag)
-            status_lbl.configure(text=f"✗ Removed '{tag}' from {len(hands)} hands")
-            self._refresh_tag_filter()
+        tag_entry.bind("<Return>", lambda e: _add_custom())
+        tk.Button(
+            custom_row,
+            text="Add",
+            bg=t["green"],
+            fg=t["bg_base"],
+            activebackground=t["bg_accent"],
+            activeforeground=t["text"],
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=3,
+            cursor="hand2",
+            font=_F_SEMIBOLD,
+            command=_add_custom,
+        ).pack(side="left", padx=4)
 
-        ctk.CTkButton(dialog, text="Done", fg_color=self.theme["bg_accent"],
-                      hover_color=self.theme["green"], text_color=self.theme["text"],
-                      width=100, command=lambda: [dialog.destroy(), self._refresh_hands_list()]
-                      ).pack(pady=(8, 12))
+        # Status + Done
+        status_lbl = tk.Label(
+            dialog,
+            text="  Click a tag to toggle it on/off",
+            bg=t["bg_base"],
+            fg=t["text_dim"],
+            font=_F_CAPTION_I,
+            anchor="w",
+        )
+        status_lbl.pack(fill="x", padx=16, pady=(0, 2))
+
+        def _close():
+            logging.debug("Closing tag dialog")
+            dialog.destroy()
+            self._refresh_hands_list()
+            if self._detail_tag_hand:
+                self._refresh_detail_tag_strip(self._detail_tag_hand)
+
+        dialog.protocol("WM_DELETE_WINDOW", _close)
+
+        tk.Button(
+            dialog,
+            text="Done  ✓",
+            bg=t["bg_accent"],
+            fg=t["text"],
+            activebackground=t["green"],
+            activeforeground=t["bg_base"],
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=5,
+            cursor="hand2",
+            font=_F_SEMIBOLD,
+            command=_close,
+        ).pack(pady=(4, 10))
 
     def _update_selection_count(self):
         count = len(self._selected_hand_ids)
@@ -6973,6 +7667,7 @@ class PokerApp(ctk.CTk):
                     self.hand_detail_text.insert("end", f"  {opp:20s}  Unknown (no data)\n")
 
         self.hand_detail_text.configure(state="disabled")
+        self._refresh_detail_tag_strip(hand)
 
         # Open a separate popup window
         self._open_hand_popup(hand, ev_diff, strength)
@@ -6997,19 +7692,42 @@ class PokerApp(ctk.CTk):
         ev_str = f"+{ev_diff:.1f}" if ev_diff >= 0 else f"{ev_diff:.1f}"
 
         tk.Label(header, text=f"{hand.hero_cards}  |  {hand.hero_position}  |  {dt}",
-                 bg=self.theme["bg_accent"], fg=self.theme["text"], font=("Consolas", 12, "bold")).pack(side="left", padx=8)
+                 bg=self.theme["bg_accent"], fg=self.theme["text"], font=_F_LABEL).pack(side="left", padx=8)
         tk.Label(header, text=f"Result: {res}", bg=self.theme["bg_accent"], fg=res_color,
-                 font=("Consolas", 12, "bold")).pack(side="right", padx=8)
+                 font=_F_LABEL).pack(side="right", padx=8)
 
         # EV bar
         ev_bar = tk.Frame(popup, bg=self.theme["bg_panel"], height=28)
         ev_bar.pack(fill="x")
         ev_bar.pack_propagate(False)
         tk.Label(ev_bar, text=f"Strength: {strength}/100  |  EV Diff: {ev_str}  |  Pot: {hand.pot:.0f}  |  {hand.site}",
-                 bg=self.theme["bg_panel"], fg=self.theme["gold"], font=("Consolas", 10)).pack(side="left", padx=8)
+                 bg=self.theme["bg_panel"], fg=self.theme["gold"], font=_F_DATA).pack(side="left", padx=8)
+
+        # Tag row — colored pills + quick-tag button
+        tag_row = tk.Frame(popup, bg=self.theme["bg_panel"], height=28)
+        tag_row.pack(fill="x", padx=4, pady=(0, 2))
+        tag_row.pack_propagate(False)
+        _popup_tags = self.db.get_tags(hand.hand_id)
+        tk.Label(tag_row, text="Tags:", bg=self.theme["bg_panel"],
+                 fg=self.theme["text_dim"], font=(_FF, 9)).pack(side="left", padx=(8, 4))
+        if _popup_tags:
+            for _tg in _popup_tags:
+                _tc = HAND_TAG_COLORS.get(_tg, self.theme["border_hl"])
+                _pf = tk.Frame(tag_row, bg=_tc, padx=1, pady=1)
+                _pf.pack(side="left", padx=2)
+                tk.Label(_pf, text=_tg, bg=_tc, fg="#111111",
+                         font=(_FF, 9, "bold"), padx=6, pady=1).pack()
+        else:
+            tk.Label(tag_row, text="none", bg=self.theme["bg_panel"],
+                     fg=self.theme["text_dim"], font=(_FF, 9, "italic")).pack(side="left")
+        tk.Button(tag_row, text="🏷 Tag", bg=self.theme["bg_accent"],
+                  fg=self.theme["text"], font=(_FF, 9), relief="flat",
+                  bd=0, padx=8, pady=1, cursor="hand2",
+                  command=lambda p=popup: self._open_tag_dialog([hand], parent=p)
+                  ).pack(side="right", padx=8)
 
         # Raw hand text
-        txt = tk.Text(popup, bg=self.theme["bg_input"], fg=self.theme["text"], font=("Consolas", 10),
+        txt = tk.Text(popup, bg=self.theme["bg_input"], fg=self.theme["text"], font=_F_DATA,
                       insertbackground=self.theme["text"], relief="flat", padx=8, pady=6,
                       selectbackground=self.theme["select_bg"])
         txt.pack(fill="both", expand=True, padx=4, pady=4)
@@ -7027,14 +7745,14 @@ class PokerApp(ctk.CTk):
             popup.after(1500, lambda: close_btn.configure(text="Close"))
 
         tk.Button(btn_bar, text="Copy Hand", bg=self.theme["bg_accent"], fg=self.theme["text"],
-                  font=("Consolas", 10), relief="flat", padx=12, command=_copy
+                  font=_F_DATA, relief="flat", padx=12, command=_copy
                   ).pack(side="left", padx=8)
         tk.Button(btn_bar, text="▶ Replay", bg=self.theme["bg_accent"], fg=self.theme["gold"],
-                  font=("Consolas", 10, "bold"), relief="flat", padx=12,
+                  font=(_FM, 10, "bold"), relief="flat", padx=12,
                   command=lambda: HandReplayerWindow(popup, hand, self.theme)
                   ).pack(side="left", padx=4)
         close_btn = tk.Button(btn_bar, text="Close", bg=self.theme["bg_accent"], fg=self.theme["text"],
-                              font=("Consolas", 10), relief="flat", padx=12,
+                              font=_F_DATA, relief="flat", padx=12,
                               command=popup.destroy)
         close_btn.pack(side="right", padx=8)
 
@@ -7059,7 +7777,7 @@ class PokerApp(ctk.CTk):
         top_bar = tk.Frame(hud, bg=self.theme["bg_accent"])
         top_bar.pack(fill="x")
         tk.Label(top_bar, text="\u2660 Player HUD / Station Detector \u2665",
-                 bg=self.theme["bg_accent"], fg=self.theme["gold"], font=("Consolas", 14, "bold")).pack(side="left", padx=8, pady=6)
+                 bg=self.theme["bg_accent"], fg=self.theme["gold"], font=_F_TITLE).pack(side="left", padx=8, pady=6)
 
         def _copy_hud():
             if not self.player_stats:
@@ -7073,30 +7791,30 @@ class PokerApp(ctk.CTk):
             hud.clipboard_append("\n".join(lines))
 
         tk.Button(top_bar, text="Copy Stats", bg=self.theme["bg_accent"], fg=self.theme["text"],
-                  font=("Consolas", 10), relief="flat", padx=10,
+                  font=_F_DATA, relief="flat", padx=10,
                   command=_copy_hud).pack(side="right", padx=8, pady=4)
 
         # Search
         search_frame = tk.Frame(hud, bg=self.theme["bg_panel"])
         search_frame.pack(fill="x", padx=4, pady=2)
         tk.Label(search_frame, text="Search:", bg=self.theme["bg_panel"], fg=self.theme["text"],
-                 font=("Consolas", 10)).pack(side="left", padx=6)
+                 font=_F_DATA).pack(side="left", padx=6)
         search_var = tk.StringVar()
         tk.Entry(search_frame, textvariable=search_var, bg=self.theme["bg_input"], fg=self.theme["text"],
-                 font=("Consolas", 10), insertbackground=self.theme["text"],
+                 font=_F_DATA, insertbackground=self.theme["text"],
                  relief="flat", width=25).pack(side="left", padx=4)
 
         # Type filter
         tk.Label(search_frame, text="  Type:", bg=self.theme["bg_panel"],
-                 fg=self.theme["text"], font=("Consolas", 10)).pack(side="left", padx=(8, 2))
+                 fg=self.theme["text"], font=_F_DATA).pack(side="left", padx=(8, 2))
         hud_type_var = tk.StringVar(value="All")
         type_values = ["All", "Fish", "Calling Station", "LAG", "TAG", "Nit", "Maniac", "Regular", "Unknown"]
         hud_type_menu = tk.OptionMenu(search_frame, hud_type_var, *type_values,
                                       command=lambda _: _populate(search_var.get(), hud_type_var.get()))
         hud_type_menu.configure(bg=self.theme["bg_accent"], fg=self.theme["text"],
-                                font=("Consolas", 9), relief="flat", highlightthickness=0)
+                                font=_F_CAPTION, relief="flat", highlightthickness=0)
         hud_type_menu["menu"].configure(bg=self.theme["bg_card"], fg=self.theme["text"],
-                                         font=("Consolas", 9))
+                                         font=_F_CAPTION)
         hud_type_menu.pack(side="left", padx=2)
 
         # Legend
@@ -7108,7 +7826,7 @@ class PokerApp(ctk.CTk):
                        ("Fish", self.theme["red"])]
         for tname, tcolor in type_badges:
             tk.Label(legend, text=tname, bg=self.theme["bg_panel"], fg=tcolor,
-                     font=("Consolas", 9, "bold")).pack(side="left", padx=4)
+                     font=(_FM, 9, "bold")).pack(side="left", padx=4)
 
         # Header
         header = tk.Frame(hud, bg=self.theme["bg_accent"])
@@ -7117,10 +7835,10 @@ class PokerApp(ctk.CTk):
         col_widths = [18, 14, 7, 7, 6, 7, 7, 6]
         header_text = "  ".join(f"{c:<{w}}" for c, w in zip(cols, col_widths))
         tk.Label(header, text=header_text, bg=self.theme["bg_accent"], fg=self.theme["gold"],
-                 font=("Consolas", 10, "bold"), anchor="w").pack(fill="x", padx=6, pady=2)
+                 font=(_FM, 10, "bold"), anchor="w").pack(fill="x", padx=6, pady=2)
 
         # Scrollable player list using Canvas + Text widget (lightweight)
-        list_text = tk.Text(hud, bg=self.theme["bg_input"], fg=self.theme["text"], font=("Consolas", 10),
+        list_text = tk.Text(hud, bg=self.theme["bg_input"], fg=self.theme["text"], font=_F_DATA,
                             relief="flat", padx=6, pady=4, state="disabled",
                             selectbackground=self.theme["select_bg"], cursor="arrow")
         scrollbar = tk.Scrollbar(
@@ -7219,14 +7937,14 @@ class PokerApp(ctk.CTk):
         override_frame.pack(fill="x", padx=4, pady=(0, 4))
 
         tk.Label(override_frame, text="Override Player Type:", bg=self.theme["bg_panel"],
-                 fg=self.theme["gold"], font=("Consolas", 10, "bold")).pack(side="left", padx=6)
+                 fg=self.theme["gold"], font=(_FM, 10, "bold")).pack(side="left", padx=6)
 
         override_name_var = tk.StringVar()
         tk.Label(override_frame, text="Player:", bg=self.theme["bg_panel"],
-                 fg=self.theme["text"], font=("Consolas", 10)).pack(side="left", padx=(4, 2))
+                 fg=self.theme["text"], font=_F_DATA).pack(side="left", padx=(4, 2))
         override_entry = tk.Entry(override_frame, textvariable=override_name_var,
                                    bg=self.theme["bg_input"], fg=self.theme["text"],
-                                   font=("Consolas", 10), insertbackground=self.theme["text"],
+                                   font=_F_DATA, insertbackground=self.theme["text"],
                                    relief="flat", width=18)
         override_entry.pack(side="left", padx=2)
 
@@ -7234,9 +7952,9 @@ class PokerApp(ctk.CTk):
         override_types = ["Fish", "Calling Station", "LAG", "TAG", "Nit", "Maniac", "Regular", "Whale", "Rec"]
         override_menu = tk.OptionMenu(override_frame, override_type_var, *override_types)
         override_menu.configure(bg=self.theme["bg_accent"], fg=self.theme["text"],
-                                font=("Consolas", 9), relief="flat", highlightthickness=0)
+                                font=_F_CAPTION, relief="flat", highlightthickness=0)
         override_menu["menu"].configure(bg=self.theme["bg_card"], fg=self.theme["text"],
-                                         font=("Consolas", 9))
+                                         font=_F_CAPTION)
         override_menu.pack(side="left", padx=4)
 
         def _set_override():
@@ -7266,10 +7984,10 @@ class PokerApp(ctk.CTk):
             _populate(search_var.get(), hud_type_var.get())
 
         tk.Button(override_frame, text="Set Type", bg=self.theme["green"],
-                  fg=self.theme["bg_base"], font=("Consolas", 9, "bold"),
+                  fg=self.theme["bg_base"], font=(_FM, 9, "bold"),
                   relief="flat", padx=8, command=_set_override).pack(side="left", padx=4)
         tk.Button(override_frame, text="Clear", bg=self.theme["red"],
-                  fg=self.theme["text"], font=("Consolas", 9),
+                  fg=self.theme["text"], font=_F_CAPTION,
                   relief="flat", padx=6, command=_clear_override).pack(side="left", padx=2)
 
         # Click player name to auto-fill override
@@ -7304,7 +8022,7 @@ class PokerApp(ctk.CTk):
             frame.grid(row=0, column=i, padx=4, pady=4, sticky="nsew")
             frame.grid_propagate(False)
             self.leak_stats_frame.grid_columnconfigure(i, weight=1)
-            ctk.CTkLabel(frame, text=name, text_color=self.theme["text_dim"], font=("Consolas", 11)).pack(pady=(6, 0))
+            ctk.CTkLabel(frame, text=name, text_color=self.theme["text_dim"], font=_F_DATA_MD).pack(pady=(6, 0))
             ctk.CTkLabel(frame, text=val, text_color=color, font=("Consolas", 18, "bold")).pack()
 
         self.leak_alerts_text.configure(state="normal")
@@ -7509,78 +8227,134 @@ class PokerApp(ctk.CTk):
 
         def do_analysis():
             session_id = f"session_{int(time.time())}"
-            results = []
-            for i, h in enumerate(hands[:50]):  # Cap at 50 for performance
-                hand_json = {
-                    "hand_id": h.hand_id,
-                    "variant": h.game_type or "NLHE",
-                    "pot_size": h.pot or 0,
-                    "hero_cards": h.hero_cards or "",
-                    "hero_position": h.hero_position or "",
-                    "board": " ".join(h.board_cards) if h.board_cards else "",
-                    "hero_won": h.hero_won or 0,
-                    "site": h.site or "",
-                    "num_players": len(h.players),
-                    "raw_text": h.raw_text[:2000] if h.raw_text else "",
-                    "actions": [],
-                    "tags": [],
-                }
-                # Build actions list
-                for street in h.streets:
-                    for act in street.get("actions", []):
-                        hand_json["actions"].append({
-                            "street": street["name"],
-                            "player": act["player"],
-                            "action": act["action"],
-                            "amount": act.get("amount", 0),
-                        })
-                try:
-                    result = self.ai_processor.analyze_hand(hand_json, provider=provider)
-                    results.append(result)
-                except Exception as e:
-                    results.append({"hand_id": h.hand_id, "analysis": f"Error: {e}", "depth": "error"})
+            results    = []
+            hero_name  = self.settings.get("hero_names", {}).get(
+                hands[0].site if hands else "", "Hero") or "Hero"
 
-                # Progress update
+            # ── Compute real session stats from filtered hands (PT4-style) ────
+            total = len(hands)
+            vpip_hands = pfr_hands = won_sd = went_sd = 0
+            pos_profit: dict = {}
+            for h in hands:
+                raw_acts = [a for s in h.streets for a in s.get("actions", [])]
+                hero_pre = [a for a in raw_acts
+                            if a.get("player") == hero_name and a.get("street") == "PREFLOP"]
+                did_vpip = any(a["action"] in ("call", "raise", "bet") for a in hero_pre)
+                did_pfr  = any(a["action"] in ("raise", "bet") for a in hero_pre)
+                if did_vpip: vpip_hands += 1
+                if did_pfr:  pfr_hands  += 1
+                all_streets = {a.get("street") for a in raw_acts if a.get("player") == hero_name}
+                if "SHOWDOWN" in all_streets or len(all_streets) >= 3:
+                    went_sd += 1
+                    if (h.hero_won or 0) > 0:
+                        won_sd += 1
+                pos = h.hero_position or "?"
+                pos_profit[pos] = pos_profit.get(pos, 0) + (h.hero_won or 0)
+
+            real_stats = {
+                "hands_analyzed": total,
+                "hero":           hero_name,
+                "VPIP":           f"{vpip_hands/total*100:.1f}%" if total else "N/A",
+                "PFR":            f"{pfr_hands/total*100:.1f}%"  if total else "N/A",
+                "WTSD":           f"{went_sd/total*100:.1f}%"    if total else "N/A",
+                "W_SD":           f"{won_sd/went_sd*100:.1f}%"   if went_sd else "N/A",
+                "net_profit":     sum(h.hero_won or 0 for h in hands),
+                "by_position":    pos_profit,
+            }
+
+            for i, h in enumerate(hands[:50]):  # Cap at 50 for performance
+                raw = h.raw_text or (
+                    f"Hand {h.hand_id} | {h.site} | {h.game_type}\n"
+                    f"Hero: {hero_name} | Cards: {h.hero_cards} | Pos: {h.hero_position}\n"
+                    f"Board: {' '.join(h.board_cards or [])} | Pot: {h.pot} | Won: {h.hero_won}\n"
+                )
+                try:
+                    result = self.ai_processor.analyze_hand(
+                        raw_text=raw, hero_name=hero_name, hand_id=str(h.hand_id)) or {}
+                except Exception as e:
+                    result = {"summary": f"Error: {e}"}
+
+                # Attach display metadata so renderer always has real values
+                result["_hand_id"]  = h.hand_id
+                result["_cards"]    = h.hero_cards or "?"
+                result["_position"] = h.hero_position or "?"
+                result["_won"]      = h.hero_won or 0
+                result["_pot"]      = h.pot or 0
+                results.append(result)
+
                 if (i + 1) % 5 == 0:
                     self.after(0, lambda n=i+1: self.ai_footer_label.configure(
                         text=f"Processed {n}/{min(len(hands), 50)} hands..."))
 
-            # Summarize
-            summary = self.ai_processor.summarize_session(session_id, hand_results=results)
+            # Session summary with REAL stats
+            summary = self.ai_processor.summarize_session(
+                session_id, hand_results=results, stats=real_stats)
 
-            # Display results
             def show_results():
                 self.ai_text.delete("1.0", "end")
                 self.ai_text.insert("1.0", f"AI ANALYSIS — {len(results)} hands\n")
                 self.ai_text.insert("end", f"Session: {session_id}\n")
                 self.ai_text.insert("end", "=" * 60 + "\n\n")
 
-                # Summary
-                self.ai_text.insert("end", "SESSION SUMMARY\n" + "-" * 40 + "\n")
-                self.ai_text.insert("end", summary.get("summary", "No summary") + "\n\n")
+                # Live stats header (PT4-style)
+                self.ai_text.insert("end", "PLAYER STATS\n" + "-" * 40 + "\n")
+                for k, v in real_stats.items():
+                    if k not in ("by_position", "hero"):
+                        self.ai_text.insert("end", f"  {k:<18} {v}\n")
+                pos_p = real_stats.get("by_position", {})
+                if pos_p:
+                    self.ai_text.insert("end", "  By Position:\n")
+                    for pos, profit in sorted(pos_p.items(), key=lambda x: -abs(x[1])):
+                        self.ai_text.insert("end", f"    {pos:<8} {profit:+.2f}\n")
+                self.ai_text.insert("end", "\n")
+
+                # AI session summary
+                self.ai_text.insert("end", "SESSION COACHING REPORT\n" + "-" * 40 + "\n")
+                sum_text = summary.get("summary", "") if isinstance(summary, dict) else str(summary)
+                self.ai_text.insert("end", sum_text + "\n\n")
 
                 # Tag frequency
-                tags = summary.get("tag_frequency", {})
+                tags = summary.get("tag_frequency", {}) if isinstance(summary, dict) else {}
                 if tags:
-                    self.ai_text.insert("end", "COMMON TAGS\n" + "-" * 40 + "\n")
-                    for tag, count in sorted(tags.items(), key=lambda x: -x[1])[:10]:
-                        self.ai_text.insert("end", f"  {tag}: {count}\n")
+                    self.ai_text.insert("end", "LEAK TAGS\n" + "-" * 40 + "\n")
+                    for tag, cnt in sorted(tags.items(), key=lambda x: -x[1])[:10]:
+                        self.ai_text.insert("end", f"  {tag}: {cnt}\n")
                     self.ai_text.insert("end", "\n")
 
-                # Individual hand results
-                self.ai_text.insert("end", "INDIVIDUAL ANALYSES\n" + "-" * 40 + "\n")
+                # Individual hand results — full PT4-style detail
+                self.ai_text.insert("end", "INDIVIDUAL HAND ANALYSES\n" + "-" * 40 + "\n")
                 for r in results:
-                    if r.get("depth") == "skip":
-                        continue
-                    self.ai_text.insert("end",
-                        f"\n{r.get('hand_id', '?')} [{r.get('depth', '?')}] "
-                        f"conf: {r.get('confidence', 0):.0%}\n")
-                    self.ai_text.insert("end", f"  {r.get('analysis', '')}\n")
+                    hid      = r.get("_hand_id", "?")
+                    cards    = r.get("_cards",    "?")
+                    pos      = r.get("_position", "?")
+                    won      = r.get("_won",       0)
+                    pot      = r.get("_pot",       0)
+                    conf     = r.get("confidence", 0.5)
+                    style    = r.get("play_style", "")
+                    ev       = r.get("ev_estimate", "")
+                    summary_ = r.get("summary", "")
+                    mistakes = r.get("mistakes_found", 0)
+                    hand_tags= ", ".join(r.get("tags", [])) if r.get("tags") else ""
+                    result_s = f"+{won:.2f}" if won >= 0 else f"{won:.2f}"
 
+                    self.ai_text.insert("end", f"\n{'─'*55}\n")
+                    self.ai_text.insert("end",
+                        f"Hand: {hid}  [{cards}]  Pos: {pos}  "
+                        f"Pot: {pot:.2f}  Result: {result_s}\n")
+                    if style or ev:
+                        self.ai_text.insert("end",
+                            f"Style: {style or 'N/A'}  |  EV: {ev or 'N/A'}  |  "
+                            f"Mistakes: {mistakes}  |  Conf: {conf:.0%}\n")
+                    if summary_:
+                        self.ai_text.insert("end", f"  → {summary_}\n")
+                    if hand_tags:
+                        self.ai_text.insert("end", f"  Tags: {hand_tags}\n")
+
+                deep  = sum(1 for r in results if r.get("play_style"))
+                errs  = sum(1 for r in results if "Error" in r.get("summary",""))
                 self.ai_footer_label.configure(
-                    text=f"Done — {len(results)} hands analyzed, "
-                         f"{sum(1 for r in results if r.get('depth') == 'deep')} deep, "
-                         f"{sum(1 for r in results if r.get('depth') == 'skip')} skipped")
+                    text=f"Done — {len(results)} hands  |  "
+                         f"{deep} analyzed  |  {errs} errors")
                 self._update_ai_status()
 
             self.after(0, show_results)
@@ -7867,6 +8641,8 @@ class PokerApp(ctk.CTk):
             self.settings["hero_names"]["BetACR"] = self.hero_bacr_var.get().strip()
         if hasattr(self, "hero_gg_var"):
             self.settings["hero_names"]["GGPoker"] = self.hero_gg_var.get().strip()
+        if hasattr(self, "hero_rp_var"):
+            self.settings["hero_names"]["ReplayPoker"] = self.hero_rp_var.get().strip()
 
         # API keys
         if hasattr(self, "openai_key_var"):

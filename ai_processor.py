@@ -3,12 +3,13 @@ AI Processor for LeakSnipe.
 Analysis:    OpenAI Responses API  (stored prompt pmpt_69cc16...)
 Chat:        gpt-4o-mini chat completions  (dynamic conversation)
 Fallback:    Claude 3.5 Sonnet  (ANTHROPIC_API_KEY)
-Local:       Ollama nemotron-cascade-2  (primary analysis, ~24 GB, premium reasoning)
-             Ollama gemma3              (secondary analysis, ~3.3 GB, GPU reasoning)
-             Ollama deepseek-r1         (backup, ~4.7 GB, chain-of-thought)
-             Ollama qwen2.5:1.5b        (fast chat, ~1 GB, CPU)
+Local:       Ollama deepseek-r1:8b       (primary analysis, ~5 GB, GTX1660 GPU, chain-of-thought)
+             Ollama qwen2.5:7b           (secondary analysis, ~4.4 GB, GTX1660 GPU, best JSON)
+             Ollama gemma3              (tertiary, ~3.3 GB, GPU reasoning)
+             Ollama nemotron-cascade-2  (premium, ~24 GB, CPU only — too large for 6GB VRAM)
+             Ollama qwen2.5:1.5b        (fast chat fallback, ~1 GB)
 """
-import json, os, re, sqlite3, logging, urllib.request
+import json, os, re, sqlite3, logging, threading, urllib.request
 from typing import Optional, Dict, Any, List
 
 log = logging.getLogger(__name__)
@@ -21,16 +22,20 @@ OPENAI_CHAT_MODEL    = "gpt-4o-mini"      # live chat: fast + cheap
 OPENAI_SESSION_MODEL = "gpt-4o"           # session fallback if no stored prompt
 CLAUDE_MODEL         = "claude-3-5-sonnet-20241022"
 OLLAMA_BASE              = "http://localhost:11434"
-OLLAMA_MODEL             = "qwen2.5:1.5b"           # fast chat on CPU (~1 GB)
-OLLAMA_MODEL_NEMOTRON    = "nemotron-cascade-2:latest" # primary analysis (~24 GB, premium)
-OLLAMA_MODEL_LARGE       = "gemma3:latest"           # secondary analysis (~3.3 GB, GPU)
-OLLAMA_MODEL_BACKUP      = "deepseek-r1:7b"          # backup reasoning / chain-of-thought (~4.7 GB)
+_DEFAULT_DB              = r"F:\LeakSnipe\poker_hands.db"
+OLLAMA_MODEL             = "qwen2.5:1.5b"           # fast chat fallback (~1 GB)
+OLLAMA_MODEL_DEEPSEEK    = "deepseek-r1:8b"          # primary analysis — GTX1660 GPU (~5 GB, chain-of-thought)
+OLLAMA_MODEL_QWEN        = "qwen2.5:7b"              # secondary analysis — GTX1660 GPU (~4.4 GB, best JSON)
+OLLAMA_MODEL_LARGE       = "gemma3:latest"           # tertiary (~3.3 GB, GPU reasoning)
+OLLAMA_MODEL_NEMOTRON    = "nemotron-cascade-2:latest" # premium (~24 GB, exceeds 6GB VRAM)
 
 # Preference order for deep analysis (hand/session). First available wins.
+# deepseek-r1:7b and qwen2.5:7b fit fully in GTX 1660 6GB VRAM.
 _OLLAMA_ANALYSIS_PRIORITY = [
-    OLLAMA_MODEL_NEMOTRON,
+    OLLAMA_MODEL_DEEPSEEK,
+    OLLAMA_MODEL_QWEN,
     OLLAMA_MODEL_LARGE,
-    OLLAMA_MODEL_BACKUP,
+    OLLAMA_MODEL_NEMOTRON,
     OLLAMA_MODEL,
 ]
 
@@ -184,9 +189,9 @@ class AIProcessor:
     Local/offline:   Ollama qwen3.5 (no key)
     """
 
-    def __init__(self, settings: dict = None, db_path: str = "poker_hands.db"):
+    def __init__(self, settings: dict = None, db_path: str = None):
         self._settings       = settings or {}
-        self._db_path        = db_path
+        self._db_path        = db_path or self._settings.get("db_path", _DEFAULT_DB)
         self._openai_client  = None
         self._anthropic_client = None
         self._active_provider = None
@@ -203,6 +208,15 @@ class AIProcessor:
             best = _best_analysis_model()
             self._active_provider = f"ollama:{best}"
             log.info(f"[AI] Ollama ready — analysis model: {best}  chat model: {OLLAMA_MODEL}")
+            # Warm up: fire a background ping so model loads into GPU before first real use
+            def _warmup():
+                try:
+                    _ollama_post("/api/generate",
+                        {"model": best, "prompt": "hi", "stream": False}, timeout=180)
+                    log.info(f"[AI] Warmup complete for {best}")
+                except Exception as e:
+                    log.warning(f"[AI] Warmup failed (model will load on first use): {e}")
+            threading.Thread(target=_warmup, daemon=True).start()
             return
 
         # 2. OpenAI cloud (when Ollama not running)
@@ -257,18 +271,24 @@ class AIProcessor:
         if _ollama_available():
             try:
                 r = _ollama_post("/api/chat",
-                    {"model": OLLAMA_MODEL, "messages": messages, "stream": False},
-                    timeout=90)
+                    {"model": _best_analysis_model(), "messages": messages, "stream": False},
+                    timeout=180)
                 reply = r.get("message", {}).get("content", "").strip()
                 if not reply:
                     reply = "[Ollama returned empty response — model may still be loading, try again]"
             except Exception as e:
                 err = str(e)
                 if "timed out" in err.lower() or "timeout" in err.lower():
-                    reply = (f"⏱️ Ollama timed out — '{OLLAMA_MODEL}' is still loading into memory.\n"
+                    _m = _best_analysis_model()
+                    reply = (f"⏱️ Ollama timed out — '{_m}' is still loading into memory.\n"
                              "Wait 10 seconds and try again.")
                 else:
-                    reply = f"[Ollama error: {e}]"
+                    _m = _best_analysis_model()
+                    if "404" in err:
+                        reply = (f"⚠️ Ollama model '{_m}' is not installed.\n"
+                                 f"Run:  ollama pull {_m}")
+                    else:
+                        reply = f"[Ollama error: {e}]"
         elif self._openai_client:
             try:
                 resp = self._openai_client.chat.completions.create(
@@ -430,6 +450,37 @@ class AIProcessor:
 
     # Backward compat
     def summarize_session(self, session_id: str = "",
-                          hand_results: list = None, **kw) -> dict:
-        texts = [r.get("analysis","") for r in (hand_results or []) if r]
-        return {"summary": self.analyze_session("\n\n".join(texts[:20]))}
+                          hand_results: list = None, stats: dict = None, **kw) -> dict:
+        # Extract hero name from the stats dict so analyze_session() uses the right name
+        _stats = stats or kw.get("stats") or {}
+        hero_name = _stats.get("hero", "Hero") or "Hero"
+
+        # Build hand summary lines — combine display metadata with AI verdict so
+        # the session prompt has real context instead of an empty hands sample.
+        lines = []
+        tag_freq: dict = {}
+        for r in (hand_results or []):
+            if not r:
+                continue
+            # Collect tags
+            for t in (r.get("tags") or []):
+                tag_freq[t] = tag_freq.get(t, 0) + 1
+
+            # Compose a single descriptive line per hand
+            hid    = r.get("_hand_id", r.get("hand_id", "?"))
+            cards  = r.get("_cards",    "??")
+            pos    = r.get("_position", "?")
+            won    = r.get("_won",       0)
+            style  = r.get("play_style", "")
+            ev     = r.get("ev_estimate", "")
+            summ   = r.get("summary", r.get("analysis", ""))
+            result_s = f"+{won:.2f}" if won >= 0 else f"{won:.2f}"
+            line = (f"Hand {hid} [{cards}] {pos} {result_s}"
+                    + (f" | {style}" if style else "")
+                    + (f" | {ev}" if ev else "")
+                    + (f": {summ[:120]}" if summ else ""))
+            lines.append(line)
+
+        session_text = "\n".join(lines[:20])
+        report = self.analyze_session(session_text, hero_name=hero_name, stats=_stats)
+        return {"summary": report, "tag_frequency": tag_freq}

@@ -9,7 +9,12 @@ a = Analysis(
     ['poker_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('poker.ico', '.'), ('ai_processor.py', '.')],
+    datas=[
+        ('poker.ico', '.'),
+        ('ai_processor.py', '.'),
+        ('ocr_capture.py', '.'),
+        ('replay_bridge_capture.js', '.'),
+    ],
     hiddenimports=[
         'PIL._tkinter_finder',
         'matplotlib.backends.backend_tkagg',
@@ -28,6 +33,8 @@ a = Analysis(
         'openai.resources',
         'httpx',
         'ai_processor',
+        'ocr_capture',
+        'pytesseract',
     ],
     hookspath=[hook_dir],
     hooksconfig={
@@ -57,7 +64,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='LeakSnipe',
+    name='LeakSnipe v.2',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

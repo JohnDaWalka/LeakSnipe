@@ -19,6 +19,11 @@ ENV/
 # IDEs
 .vscode/
 .idea/
+*.code-workspace
+
+# Local nested repos / build trees (not part of Python app)
+Poker-Suite/
+poker-build/
 *.swp
 *.swo
 *~

@@ -1,67 +1,26 @@
 {
   "hero_names": {
-    "ACR": "JohnDaWalka",
-    "CoinPoker": "jdwalka",
-    "BetACR": "JohnDaWalka",
-    "GGPoker": ""
+    "ACR": "",
+    "CoinPoker": "",
+    "BetACR": "",
+    "GGPoker": "",
+    "ReplayPoker": ""
   },
-  "scan_dirs": [
-    {
-      "path": "D:\\Hand2Note4Hh\\CoinPoker",
-      "site": "CoinPoker"
-    },
-    {
-      "path": "D:\\ACR Poker\\handHistory\\JohnDaWalka",
-      "site": "ACR"
-    },
-    {
-      "path": "D:\\ACR Poker\\handHistory\\JohnDaWalka - Copy",
-      "site": "ACR"
-    },
-    {
-      "path": "D:\\ACR Poker\\TournamentSummary\\JohnDaWalka",
-      "site": "ACR"
-    },
-    {
-      "path": "D:\\HM3Archive\\Winning Poker Network",
-      "site": "ACR"
-    },
-    {
-      "path": "D:\\Hand2Note4Hh\\MyHandsArchive_H2N4\\WinningPokerNetwork",
-      "site": "BetACR"
-    },
-    {
-      "path": "D:\\ACR Poker",
-      "site": "ACR"
-    }
-  ],
+  "scan_dirs": [],
   "auto_refresh": true,
   "refresh_interval": 5,
-  "dh2_db_path": "D:\\Users\\admin\\AppData\\Roaming\\DriveHUD 2\\drivehud2.db",
-  "dh2_auto_sync": false,
-  "dh2_sync_interval": 5,
   "theme": "Slate Blue",
-  "advanced_mode": true,
+  "advanced_mode": false,
   "live_hud_enabled": false,
-  "hud_opacity": 0.74,
+  "hud_opacity": 0.75,
   "hud_seat_layout": "9max",
   "hud_density": "compact",
   "hud_site_preset": "auto",
   "hud_anchor": "top-left",
   "hud_offset_x": 0,
   "hud_offset_y": 0,
-  "hud_site_profiles": {
-    "CoinPoker": {
-      "anchor": "bottom-left",
-      "density": "expanded",
-      "seat_layout": "9max",
-      "offset_x": 0,
-      "offset_y": 0,
-      "badge_offsets": {}
-    }
-  },
-  "dh2_db_paths": [
-    "D:\\Users\\admin\\AppData\\Roaming\\DriveHUD 2\\drivehud2.db",
-    "D:\\Users\\admin\\AppData\\Roaming\\DriveHUD 2\\drivehud.db"
-  ]
+  "hud_site_profiles": {},
+  "db_path": "poker_hands.db",
+  "dh2_auto_sync": false,
+  "dh2_sync_interval": 5
 }

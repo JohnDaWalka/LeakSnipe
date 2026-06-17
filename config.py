@@ -98,6 +98,7 @@ def load_settings() -> Dict[str, Any]:
             "CoinPoker": "",
             "BetACR": "",
             "GGPoker": "",
+            "ReplayPoker": "",
             "ClubGG": "",
             "PokerStars": "",
             "888poker": "",

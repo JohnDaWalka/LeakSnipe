@@ -1,7 +1,7 @@
 """
 Hand parsing logic for multiple poker sites.
 Supports CoinPoker, BetACR (WPN), GGPoker, ClubGG, PokerStars, 888poker,
-and Ignition/Bovada hand history formats.
+Ignition/Bovada, and Replay Poker hand history formats.
 """
 
 import re
@@ -9,7 +9,58 @@ import logging
 from typing import Optional, Dict, List, Any
 from datetime import datetime
 
+try:
+    from dateutil import tz as _tz
+    _LOCAL_TZ = _tz.tzlocal()
+    _SITE_TZ_MAP: Dict[str, Any] = {
+        "UTC":  _tz.UTC,
+        "GMT":  _tz.UTC,
+        "ET":   _tz.gettz("America/New_York"),
+        "EST":  _tz.gettz("America/New_York"),
+        "EDT":  _tz.gettz("America/New_York"),
+        "CET":  _tz.gettz("Europe/Berlin"),
+        "CEST": _tz.gettz("Europe/Berlin"),
+        "PT":   _tz.gettz("America/Los_Angeles"),
+        "CT":   _tz.gettz("America/Chicago"),
+    }
+    _HAS_DATEUTIL = True
+except ImportError:
+    _HAS_DATEUTIL = False
+    _SITE_TZ_MAP = {}
+
 from models import Hand
+
+
+def _parse_hand_datetime(dt_str: str, tz_suffix: str = "",
+                         default_tz_key: str = "") -> datetime:
+    """Parse a hand timestamp and convert it to a naive local datetime.
+
+    *dt_str*        – the bare date/time string extracted from the header.
+    *tz_suffix*     – timezone label found in the header (e.g. "ET", "UTC").
+    *default_tz_key*– fallback timezone key when no suffix is present in
+                      the header (e.g. "ET" for BetACR which always uses ET).
+    """
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                "%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            parsed = datetime.strptime(dt_str.strip(), fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        return datetime.now()
+
+    if not _HAS_DATEUTIL:
+        return parsed
+
+    key = (tz_suffix.strip().upper() or default_tz_key.upper())
+    tz_info = _SITE_TZ_MAP.get(key)
+    if tz_info is None:
+        return parsed  # unknown suffix — treat as local
+
+    # Convert: attach the site tz → convert to local → strip tz info
+    aware = parsed.replace(tzinfo=tz_info)
+    return aware.astimezone(_LOCAL_TZ).replace(tzinfo=None)
 
 
 class HandParser:
@@ -20,6 +71,16 @@ class HandParser:
 
     def detect_site(self, text: str) -> Optional[str]:
         """Detect which poker site the hand is from based on text content."""
+        stripped_text = text.lstrip()
+        if stripped_text.startswith("<?xml") or "<HandHistory" in text:
+            site_match = re.search(r"<Site>([^<]+)</Site>", text, re.IGNORECASE)
+            if site_match:
+                site_name = site_match.group(1).strip()
+                if site_name in ("ACR", "BetACR"):
+                    return "BetACR"
+                if site_name in ("CoinPoker", "PokerStars", "Ignition", "Bovada"):
+                    return "Ignition" if site_name == "Bovada" else site_name
+                return site_name
         for line in text.split("\n"):
             stripped = line.strip()
             if stripped.startswith("CoinPoker Hand #"):
@@ -38,10 +99,24 @@ class HandParser:
                 return "Ignition"
             if stripped.startswith("Bovada Hand #") or "Bovada" in stripped:
                 return "Ignition"
+            if (
+                stripped.startswith("Replay Poker Hand #")
+                or stripped.startswith("***** Replay Poker Hand History for Game")
+                or ("Replay Poker" in stripped and ("Hand" in stripped or "Game" in stripped))
+            ):
+                return "ReplayPoker"
         return None
 
     def split_hands(self, text: str, site: str) -> List[str]:
         """Split raw text into individual hand texts."""
+        stripped_text = text.lstrip()
+        if stripped_text.startswith("<?xml") or "<HandHistory" in text:
+            if "<?xml" in text:
+                parts = re.split(r"(?=<\?xml\b)", text)
+            else:
+                parts = re.split(r"(?=<HandHistory\b)", text)
+            return [part.strip() for part in parts if part.strip()]
+
         hands = []
         current: List[str] = []
         for line in text.split("\n"):
@@ -70,6 +145,13 @@ class HandParser:
                     hands.append("\n".join(current))
                 current = [line]
             elif site == "Ignition" and (line.strip().startswith("Ignition Hand #") or line.strip().startswith("Bovada Hand #")):
+                if current:
+                    hands.append("\n".join(current))
+                current = [line]
+            elif site == "ReplayPoker" and (
+                line.strip().startswith("***** Replay Poker Hand History for Game")
+                or line.strip().startswith("Replay Poker Hand #")
+            ):
                 if current:
                     hands.append("\n".join(current))
                 current = [line]
@@ -109,6 +191,10 @@ class HandParser:
 
     def _parse_single(self, text: str, site: str) -> Optional[Hand]:
         """Parse a single hand based on detected site."""
+        stripped_text = text.lstrip()
+        if stripped_text.startswith("<?xml") or "<HandHistory" in text:
+            return self._parse_dh2_xml(text, site)
+
         if site == "CoinPoker":
             return self._parse_coinpoker(text)
         elif site in ("ACR", "BetACR"):
@@ -123,12 +209,16 @@ class HandParser:
             return self._parse_888poker(text)
         elif site == "Ignition":
             return self._parse_ignition(text)
+        elif site == "ReplayPoker":
+            return self._parse_replaypoker(text)
 
         # Fallback: Try to detect format from content
         if "CoinPoker Hand #" in text:
             return self._parse_coinpoker(text)
         if "Game Hand #" in text:
             return self._parse_acr(text, site_label="BetACR")
+        if "Replay Poker" in text:
+            return self._parse_replaypoker(text)
 
         return None
 
@@ -153,12 +243,10 @@ class HandParser:
         if bi:
             h.buy_in = f"{bi.group(1)}+{bi.group(2)}"
         h.game_type = "NLHE"
-        dm = re.search(r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})", header)
+        dm = re.search(r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\s*([A-Z]{2,4})?", header)
         if dm:
-            try:
-                h.date = datetime.strptime(dm.group(1), "%Y/%m/%d %H:%M:%S")
-            except ValueError:
-                h.date = datetime.now()
+            h.date = _parse_hand_datetime(dm.group(1), dm.group(2) or "",
+                                          default_tz_key="UTC")
         else:
             h.date = datetime.now()
 
@@ -202,6 +290,162 @@ class HandParser:
 
         h.hero_won = self._calc_hero_result(h, hero)
         h.hero_position = self._calc_position(h, hero)
+        return h
+
+    def _parse_dh2_xml(self, xml_text: str, site_name: str) -> Optional[Hand]:
+        """Parse DriveHUD2-style XML hand histories stored in raw_text."""
+        h = Hand()
+        h.site = "BetACR" if site_name in ("ACR", "BetACR") else site_name
+        h.raw_text = xml_text
+        hero = self.settings.get("hero_names", {}).get(h.site, "")
+
+        def xval(tag: str) -> str:
+            match = re.search(rf"<{tag}[^>]*>([^<]*)</{tag}>", xml_text, re.IGNORECASE)
+            return match.group(1).strip() if match else ""
+
+        def xattr(element: str, attr: str) -> str:
+            match = re.search(rf'{attr}="([^"]*)"', element, re.IGNORECASE)
+            return match.group(1) if match else ""
+
+        hand_num = xval("HandId") or xval("HandNumber") or xval("GameNumber")
+        if not hand_num:
+            return None
+        prefix = "CP" if h.site == "CoinPoker" else "ACR"
+        h.hand_id = f"{prefix}_{hand_num}"
+
+        game_type = (xval("GameType") or "").lower()
+        if "omaha" in game_type:
+            h.game_type = "PLO"
+        elif "holdem" in game_type:
+            h.game_type = "NLHE"
+        else:
+            h.game_type = "NLHE"
+
+        tournament_id = xval("TournamentId")
+        h.is_tournament = bool(tournament_id)
+        h.tournament_id = tournament_id
+
+        h.table_name = xval("TableName")
+        try:
+            h.max_seats = int(xval("TotalSeatNumber") or xval("NumPlayersSeated") or "0")
+        except ValueError:
+            h.max_seats = 0
+        try:
+            h.button_seat = int(xval("DealerButtonPosition") or "0")
+        except ValueError:
+            h.button_seat = 0
+
+        timestamp = xval("DateOfHandUtc") or xval("DateOfHand")
+        if timestamp:
+            for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %I:%M:%S %p"):
+                try:
+                    h.date = datetime.strptime(timestamp.split(".")[0], fmt)
+                    break
+                except ValueError:
+                    continue
+        if not h.date:
+            h.date = datetime.now()
+
+        xml_hero = xval("HeroName") or hero
+
+        player_count = 0
+        for player_match in re.finditer(r"<Player\b([^/]*?)/>", xml_text, re.DOTALL):
+            elem = player_match.group(0)
+            pname = xattr(elem, "PlayerName")
+            try:
+                seat = int(xattr(elem, "SeatNumber") or "0")
+            except ValueError:
+                seat = 0
+            try:
+                stack = float(xattr(elem, "StartingStack") or "0")
+            except ValueError:
+                stack = 0.0
+            is_hero = pname == xml_hero
+            h.players[seat] = {"name": pname, "stack": stack, "is_hero": is_hero}
+            player_count += 1
+            if is_hero:
+                cards_str = xattr(elem, "HoleCards") or xattr(elem, "Cards") or ""
+                if cards_str:
+                    h.hero_cards = " ".join(
+                        cards_str[i:i + 2] for i in range(0, len(cards_str) - 1, 2)
+                    )
+        if h.max_seats == 0:
+            h.max_seats = player_count
+
+        action_map = {
+            "SMALL_BLIND": "post",
+            "BIG_BLIND": "post",
+            "ANTE": "post",
+            "POSTS": "post",
+            "RAISE": "raise",
+            "CALL": "call",
+            "CHECK": "check",
+            "BET": "bet",
+            "FOLD": "fold",
+            "UNCALLED_BET": "return",
+            "WINS": "win",
+            "WINS_SIDE_POT": "win",
+            "ALL_IN": "raise",
+        }
+        street_map = {"Preflop": "Preflop", "Flop": "Flop", "Turn": "Turn", "River": "River", "Summary": "Showdown", "Showdown": "Showdown"}
+        streets_order = ["Preflop", "Flop", "Turn", "River", "Showdown"]
+        streets_map: Dict[str, Dict[str, Any]] = {}
+        for action_match in re.finditer(r"<HandAction\b([^/]*?)/>", xml_text, re.DOTALL):
+            elem = action_match.group(0)
+            pname = xattr(elem, "PlayerName")
+            raw_type = xattr(elem, "HandActionType")
+            street_name = street_map.get(xattr(elem, "Street") or "Preflop", "Preflop")
+            try:
+                amount = abs(float(xattr(elem, "Amount") or "0"))
+            except ValueError:
+                amount = 0.0
+            action = action_map.get(raw_type, raw_type.lower())
+            if street_name not in streets_map:
+                streets_map[street_name] = {"name": street_name, "cards": [], "actions": []}
+            streets_map[street_name]["actions"].append(
+                {"player": pname, "action": action, "amount": amount}
+            )
+            if action == "win" and amount > 0:
+                h.winners.append({"name": pname, "amount": amount})
+
+        h.streets = [streets_map[name] for name in streets_order if name in streets_map]
+
+        community_cards = xval("CommunityCards")
+        if community_cards:
+            h.board_cards = [community_cards[i:i + 2] for i in range(0, len(community_cards) - 1, 2)]
+
+        try:
+            h.pot = float(xval("TotalPot") or "0")
+        except ValueError:
+            h.pot = 0.0
+        try:
+            h.rake = float(xval("Rake") or "0")
+        except ValueError:
+            h.rake = 0.0
+
+        if not h.winners:
+            for player_match in re.finditer(r"<Player\b([^/]*?)/>", xml_text, re.DOTALL):
+                elem = player_match.group(0)
+                pname = xattr(elem, "PlayerName")
+                try:
+                    win_amt = float(xattr(elem, "Win") or "0")
+                except ValueError:
+                    win_amt = 0.0
+                if win_amt > 0:
+                    h.winners.append({"name": pname, "amount": win_amt})
+
+        hero_invested = 0.0
+        hero_won_amt = 0.0
+        for street in h.streets:
+            for act in street.get("actions", []):
+                if act["player"] != xml_hero:
+                    continue
+                if act["action"] in ("post", "raise", "call", "bet"):
+                    hero_invested += act["amount"]
+                elif act["action"] in ("win", "return"):
+                    hero_won_amt += act["amount"]
+        h.hero_won = hero_won_amt - hero_invested
+        h.hero_position = self._calc_position(h, xml_hero)
         return h
 
     def _parse_streets_coinpoker(self, lines: List[str], hero: str) -> List[Dict[str, Any]]:
@@ -255,6 +499,7 @@ class HandParser:
         """Parse BetACR / WPN hand history format."""
         h = Hand()
         h.site = site_label
+        h.raw_text = text
         lines = text.split("\n")
         hero_names = self.settings.get("hero_names", {})
         hero = hero_names.get(site_label) or hero_names.get("BetACR", "JohnDaWalka")
@@ -271,12 +516,10 @@ class HandParser:
             h.is_tournament = True
             h.tournament_id = tm.group(1)
         h.game_type = "NLHE"
-        dm = re.search(r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})", header)
+        dm = re.search(r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\s*([A-Z]{2,4})?", header)
         if dm:
-            try:
-                h.date = datetime.strptime(dm.group(1), "%Y/%m/%d %H:%M:%S")
-            except ValueError:
-                h.date = datetime.now()
+            h.date = _parse_hand_datetime(dm.group(1), dm.group(2) or "",
+                                          default_tz_key="ET")
         else:
             h.date = datetime.now()
 
@@ -316,9 +559,17 @@ class HandParser:
             h.pot = float(pot_m.group(1))
 
         for line in lines:
-            wm = re.match(r"(.+?) collected \$?(\d+(?:\.\d+)?) from", line.strip())
+            stripped = line.strip()
+            wm = re.match(r"(.+?) collected \$?(\d+(?:\.\d+)?) from", stripped)
             if wm:
                 h.winners.append({"name": wm.group(1), "amount": float(wm.group(2))})
+                continue
+            summary_wm = re.match(
+                r"Seat \d+: (.+?)(?: \([^)]*\))* (?:showed \[[^\]]+\]|did not show|mucked(?: \[[^\]]+\])?) and won \$?(\d+(?:\.\d+)?)",
+                stripped,
+            )
+            if summary_wm:
+                h.winners.append({"name": summary_wm.group(1), "amount": float(summary_wm.group(2))})
 
         h.hero_won = self._calc_hero_result(h, hero)
         h.hero_position = self._calc_position(h, hero)
@@ -327,6 +578,179 @@ class HandParser:
     def _parse_ggpoker(self, text: str) -> Optional[Hand]:
         """Stub GGPoker parser — returns None until full implementation is added."""
         return None
+
+    def _parse_replaypoker(self, text: str) -> Optional[Hand]:
+        """Parse Replay Poker / casino.org hand history format."""
+        h = Hand()
+        h.site = "ReplayPoker"
+        lines = text.split("\n")
+        hero = self.settings.get("hero_names", {}).get("ReplayPoker", "")
+
+        hand_id: Optional[str] = None
+        for pattern in (
+            r"Replay Poker Hand #(\d+)",
+            r"Replay Poker Hand History for Game (\d+)",
+            r"\*{5}\s*Hand (\d+)\s*\*{5}",
+        ):
+            match = re.search(pattern, text)
+            if match:
+                hand_id = match.group(1)
+                break
+        if not hand_id:
+            return None
+        h.hand_id = f"RP_{hand_id}"
+
+        h.game_type = "PLO" if "omaha" in text.lower() else "NLHE"
+
+        dm = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", text)
+        if dm:
+            h.date = _parse_hand_datetime(dm.group(1))
+        else:
+            h.date = datetime.now()
+
+        table_line = next((line.strip() for line in lines if line.strip().startswith("Table:")), "")
+        if table_line:
+            table_text = table_line.split(":", 1)[1].strip()
+            table_text = re.sub(r"\s+\(\d+\)$", "", table_text)
+            seats_match = re.search(r"\((\d+)\s*max\)", table_text, re.IGNORECASE)
+            if seats_match:
+                h.max_seats = int(seats_match.group(1))
+                table_text = re.sub(r"\s*\(\d+\s*max\)", "", table_text, flags=re.IGNORECASE).strip()
+            h.table_name = table_text
+
+        players_m = re.search(r"Players:\s*(\d+)", text, re.IGNORECASE)
+        if players_m and not h.max_seats:
+            h.max_seats = int(players_m.group(1))
+
+        button_line = re.search(r"Seat #(\d+) is the button", text)
+        if button_line:
+            h.button_seat = int(button_line.group(1))
+
+        for line in lines:
+            seat_m = re.match(
+                r"Seat (\d+): (.+?)(?: \(([^)]*)\))? \(\$?([\d,]+(?:\.\d+)?) in chips\)",
+                line.strip(),
+            )
+            if not seat_m:
+                continue
+            seat_num = int(seat_m.group(1))
+            name = seat_m.group(2).strip()
+            role = (seat_m.group(3) or "").strip().upper()
+            stack = self._parse_amount(seat_m.group(4))
+            if role in {"BTN", "BUTTON", "DEALER"} and not h.button_seat:
+                h.button_seat = seat_num
+            h.players[seat_num] = {"name": name, "stack": stack, "is_hero": name == hero}
+
+        if hero:
+            hc = re.search(r"Dealt to " + re.escape(hero) + r" \[(.+?)\]", text)
+            if hc:
+                h.hero_cards = hc.group(1)
+
+        h.streets = self._parse_streets_replaypoker(lines)
+        h.board_cards = self._extract_board(text) or self._collect_board_from_streets(h.streets)
+
+        pot_m = re.search(r"(?:Total pot|Pot):\s*\$?([\d,]+(?:\.\d+)?)", text, re.IGNORECASE)
+        if pot_m:
+            h.pot = self._parse_amount(pot_m.group(1))
+        rake_m = re.search(r"Rake:?\s*\$?([\d,]+(?:\.\d+)?)", text, re.IGNORECASE)
+        if rake_m:
+            h.rake = self._parse_amount(rake_m.group(1))
+
+        for line in lines:
+            stripped = line.strip()
+            collected_m = re.match(r"(.+?) collected \$?([\d,]+(?:\.\d+)?) from", stripped)
+            if collected_m:
+                h.winners.append(
+                    {"name": collected_m.group(1), "amount": self._parse_amount(collected_m.group(2))}
+                )
+                continue
+            winner_m = re.match(
+                r"Winner:\s*(.+?)(?:\s+\(\$?([\d,]+(?:\.\d+)?)\))?$",
+                stripped,
+                re.IGNORECASE,
+            )
+            if winner_m:
+                h.winners.append(
+                    {
+                        "name": winner_m.group(1).strip(),
+                        "amount": self._parse_amount(winner_m.group(2) or "0"),
+                    }
+                )
+
+        if len(h.winners) == 1 and h.winners[0]["amount"] == 0.0 and h.pot > 0:
+            h.winners[0]["amount"] = h.pot
+
+        h.hero_won = self._calc_hero_result(h, hero)
+        h.hero_position = self._calc_position(h, hero)
+        return h
+
+    def _parse_streets_replaypoker(self, lines: List[str]) -> List[Dict[str, Any]]:
+        """Parse streets and actions from Replay Poker format."""
+        current_street: Dict[str, Any] = {"name": "Preflop", "cards": [], "actions": []}
+        streets = [current_street]
+        player_names = sorted(
+            {
+                match.group(2).strip()
+                for match in (
+                    re.match(
+                        r"Seat (\d+): (.+?)(?: \(([^)]*)\))? \(\$?([\d,]+(?:\.\d+)?) in chips\)",
+                        line.strip(),
+                    )
+                    for line in lines
+                )
+                if match
+            },
+            key=len,
+            reverse=True,
+        )
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("*** HOLE CARDS ***"):
+                continue
+            if stripped.startswith("*** FLOP ***"):
+                cards_m = re.search(r"\[(.+?)\]", stripped)
+                cards = cards_m.group(1).split() if cards_m else []
+                current_street = {"name": "Flop", "cards": cards, "actions": []}
+                streets.append(current_street)
+                continue
+            if stripped.startswith("*** TURN ***"):
+                cards_m = re.findall(r"\[(.+?)\]", stripped)
+                cards = cards_m[-1].split() if cards_m else []
+                current_street = {"name": "Turn", "cards": cards, "actions": []}
+                streets.append(current_street)
+                continue
+            if stripped.startswith("*** RIVER ***"):
+                cards_m = re.findall(r"\[(.+?)\]", stripped)
+                cards = cards_m[-1].split() if cards_m else []
+                current_street = {"name": "River", "cards": cards, "actions": []}
+                streets.append(current_street)
+                continue
+            if stripped.startswith("*** SHOW DOWN ***") or stripped.startswith("*** SUMMARY ***"):
+                continue
+            if not stripped or stripped.startswith("Seat ") or stripped.startswith("Table:") or stripped.startswith("Players:"):
+                continue
+            if stripped.startswith("Dealt to"):
+                continue
+            if ": " in stripped:
+                pname, action_str = stripped.split(": ", 1)
+                action, amount = self._parse_action(action_str)
+                if action:
+                    current_street["actions"].append({"player": pname, "action": action, "amount": amount})
+                continue
+            for pname in player_names:
+                if stripped.startswith(pname + " "):
+                    action, amount = self._parse_action(stripped[len(pname) + 1 :])
+                    if action:
+                        current_street["actions"].append({"player": pname, "action": action, "amount": amount})
+                    break
+        return streets
+
+    @staticmethod
+    def _parse_amount(value: str) -> float:
+        """Parse a currency or chip amount that may include commas or a $ prefix."""
+        cleaned = re.sub(r"[^\d.]", "", value or "")
+        return float(cleaned) if cleaned else 0.0
 
     def _parse_streets_acr(self, lines: List[str], hero: str) -> List[Dict[str, Any]]:
         """Parse streets and actions from ACR/BetACR format."""
@@ -392,29 +816,26 @@ class HandParser:
     @staticmethod
     def _parse_action(action_str: str) -> tuple[Optional[str], float]:
         """Parse an action string into action type and amount."""
+        def _find_amount(pattern: str = r"(\d[\d,]*(?:\.\d+)?)") -> float:
+            match = re.search(pattern, action_str)
+            return HandParser._parse_amount(match.group(1)) if match else 0.0
+
         action_str = action_str.strip().lower()
         if action_str.startswith("fold"):
             return "fold", 0.0
         if action_str.startswith("check"):
             return "check", 0.0
         if action_str.startswith("call"):
-            am = re.search(r"(\d+(?:\.\d+)?)", action_str)
-            return "call", float(am.group(1)) if am else 0.0
+            return "call", _find_amount()
         if action_str.startswith("raise"):
-            am = re.search(r"to (\d+(?:\.\d+)?)", action_str)
-            if am:
-                return "raise", float(am.group(1))
-            am = re.search(r"(\d+(?:\.\d+)?)", action_str)
-            return "raise", float(am.group(1)) if am else 0.0
+            amount = _find_amount(r"to (\d[\d,]*(?:\.\d+)?)")
+            return "raise", amount if amount else _find_amount()
         if action_str.startswith("bet"):
-            am = re.search(r"(\d+(?:\.\d+)?)", action_str)
-            return "bet", float(am.group(1)) if am else 0.0
+            return "bet", _find_amount()
         if "all-in" in action_str or "allin" in action_str:
-            am = re.search(r"(\d+(?:\.\d+)?)", action_str)
-            return "raise", float(am.group(1)) if am else 0.0
+            return "raise", _find_amount()
         if action_str.startswith("posts"):
-            am = re.search(r"(\d+(?:\.\d+)?)", action_str)
-            return "post", float(am.group(1)) if am else 0.0
+            return "post", _find_amount()
         return None, 0.0
 
     @staticmethod
@@ -424,6 +845,14 @@ class HandParser:
         if m:
             return m.group(1).split()
         return []
+
+    @staticmethod
+    def _collect_board_from_streets(streets: List[Dict[str, Any]]) -> List[str]:
+        """Assemble a full board when the hand history omits a summary board line."""
+        board: List[str] = []
+        for street in streets:
+            board.extend(street.get("cards", []))
+        return board
 
     @staticmethod
     def _calc_hero_result(h: Hand, hero: str) -> float:
@@ -436,15 +865,15 @@ class HandParser:
         # Credit uncalled bet returned to hero
         raw = getattr(h, "raw_text", "") or ""
         if raw and hero:
-            ub = re.search(
+            for ub in re.finditer(
                 r"Uncalled bet \(\$?(\d+(?:\.\d+)?)\) returned to "
                 + re.escape(hero),
                 raw,
-            )
-            if ub:
+            ):
                 won += float(ub.group(1))
 
         invested: float = 0.0
+        preflop_raised = False
         for street in h.streets:
             hero_acts = [
                 (act.get("action", ""), float(act.get("amount", 0.0)))
@@ -456,6 +885,8 @@ class HandParser:
                 if a == "raise":
                     last_raise_idx = i
             if last_raise_idx is not None:
+                if street.get("name") == "Preflop":
+                    preflop_raised = True
                 street_total = hero_acts[last_raise_idx][1]
                 for a, amt in hero_acts[last_raise_idx + 1:]:
                     if a in ("call", "bet"):
@@ -465,6 +896,14 @@ class HandParser:
                     amt for a, amt in hero_acts if a in ("call", "bet", "post")
                 )
             invested += street_total
+
+        if preflop_raised and raw and hero:
+            for ante in re.finditer(
+                re.escape(hero) + r" posts ante (\d+(?:\.\d+)?)",
+                raw,
+                re.IGNORECASE,
+            ):
+                invested += float(ante.group(1))
 
         if won > 0:
             return won - invested
@@ -522,12 +961,10 @@ class HandParser:
             if tm:
                 h.tournament_id = tm.group(1)
 
-        dm = re.search(r"(\d{4}/\d{2}/\d{2} \d{1,2}:\d{2}:\d{2})", header)
+        dm = re.search(r"(\d{4}/\d{2}/\d{2} \d{1,2}:\d{2}:\d{2})\s*([A-Z]{2,4})?", header)
         if dm:
-            try:
-                h.date = datetime.strptime(dm.group(1), "%Y/%m/%d %H:%M:%S")
-            except ValueError:
-                h.date = datetime.now()
+            h.date = _parse_hand_datetime(dm.group(1), dm.group(2) or "",
+                                          default_tz_key="ET")
         else:
             h.date = datetime.now()
 
@@ -590,12 +1027,9 @@ class HandParser:
             return None
         h.hand_id = f"888_{m.group(1)}"
 
-        dm = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", text)
+        dm = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*([A-Z]{2,4})?", text)
         if dm:
-            try:
-                h.date = datetime.strptime(dm.group(1), "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                h.date = datetime.now()
+            h.date = _parse_hand_datetime(dm.group(1), dm.group(2) or "")
         else:
             h.date = datetime.now()
 
@@ -658,12 +1092,9 @@ class HandParser:
             if tm:
                 h.tournament_id = tm.group(1)
 
-        dm = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", text)
+        dm = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*([A-Z]{2,4})?", text)
         if dm:
-            try:
-                h.date = datetime.strptime(dm.group(1), "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                h.date = datetime.now()
+            h.date = _parse_hand_datetime(dm.group(1), dm.group(2) or "")
         else:
             h.date = datetime.now()
 
