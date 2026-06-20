@@ -4,6 +4,7 @@ import {
   checkBackendHealth,
   getApiBase,
   getSidecarStatus,
+  handSummaryToDetailPreview,
   HEALTH_POLL_INTERVAL_MS,
   launchSidecarWindow,
   restartSidecar,
@@ -75,6 +76,7 @@ function App() {
   const [selectedHand, setSelectedHand] = useState<HandDetail | null>(null);
   const [replayerHand, setReplayerHand] = useState<HandDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
   const [replayerLoadingId, setReplayerLoadingId] = useState<string | null>(null);
   const [hudError, setHudError] = useState<string | null>(null);
   const [sidecarOnline, setSidecarOnline] = useState<boolean | null>(null);
@@ -84,34 +86,45 @@ function App() {
   const tableScrollRef = useRef<HTMLDivElement>(null);
   const handsCountRef = useRef(0);
   const handsAbortRef = useRef<AbortController | null>(null);
+  const detailRequestRef = useRef(0);
   const statsPollRef = useRef<number | null>(null);
   const statsWarmStartedRef = useRef<number | null>(null);
   const STATS_WARM_TIMEOUT_MS = 60_000;
 
   const refreshHands = useCallback(async (silent = false) => {
-    handsAbortRef.current?.abort();
     const controller = new AbortController();
-    handsAbortRef.current = controller;
+    // Silent polls must not abort an in-flight initial/manual load (was leaving handsLoading stuck).
+    if (!silent) {
+      handsAbortRef.current?.abort();
+      handsAbortRef.current = controller;
+      setHandsLoading(true);
+      setError(null);
+    }
 
     const scrollTop = silent ? (tableScrollRef.current?.scrollTop ?? 0) : 0;
-    if (!silent) setHandsLoading(true);
-    setError(null);
     try {
       const signal = controller.signal;
-      const [recent, cfg, watch, status] = await Promise.all([
-        api.recentHands(50, signal),
-        api.settings(signal),
-        api.watchFolders(signal),
-        api.importStatus(signal).catch(() => null),
-      ]);
+      const [recentResult, settingsResult, foldersResult, statusResult] =
+        await Promise.allSettled([
+          api.recentHands(50, signal),
+          api.settings(signal),
+          api.watchFolders(signal),
+          api.importStatus(signal),
+        ]);
       if (signal.aborted) return;
+      if (recentResult.status === "rejected") {
+        throw recentResult.reason;
+      }
+      const recent = recentResult.value;
       setSidecarOnline(true);
-      setHands(recent.hands);
-      handsCountRef.current = recent.total ?? recent.hands.length;
-      setTotalHands(recent.total ?? recent.hands.length);
+      setHands(recent.hands ?? []);
+      handsCountRef.current = recent.total ?? recent.hands?.length ?? 0;
+      setTotalHands(recent.total ?? recent.hands?.length ?? 0);
       if (recent.db_path) setDbPath(recent.db_path);
-      setSettings(cfg);
-      setFolders(watch);
+      if (settingsResult.status === "fulfilled") setSettings(settingsResult.value);
+      if (foldersResult.status === "fulfilled") setFolders(foldersResult.value);
+      const status =
+        statusResult.status === "fulfilled" ? statusResult.value : null;
       if (status) {
         setImportStatus(status);
         if (status.total_hands) setTotalHands(status.total_hands);
@@ -126,11 +139,15 @@ function App() {
     } catch (err) {
       if (controller.signal.aborted) return;
       const message = err instanceof Error ? err.message : String(err);
-      setError(message);
-      setSidecarOnline(false);
+      if (!silent || handsCountRef.current === 0) {
+        setError(message);
+      }
+      if (handsCountRef.current === 0) {
+        setSidecarOnline(false);
+      }
     } finally {
-      if (!controller.signal.aborted && !silent) setHandsLoading(false);
-      if (handsAbortRef.current === controller) {
+      if (!silent && handsAbortRef.current === controller) {
+        setHandsLoading(false);
         handsAbortRef.current = null;
       }
     }
@@ -332,18 +349,28 @@ function App() {
   };
 
   const openHand = async (handId: string) => {
-    if (selectedHandId === handId && selectedHand) return;
+    if (selectedHandId === handId && selectedHand && !detailLoading && !detailError) return;
+
+    const preview = hands.find((h) => h.hand_id === handId);
+    const reqId = ++detailRequestRef.current;
+
     setSelectedHandId(handId);
+    setDetailError(null);
     setDetailLoading(true);
-    setSelectedHand(null);
+    setSelectedHand(preview ? handSummaryToDetailPreview(preview) : null);
+
     try {
       const hand = await fetchHand(handId);
+      if (detailRequestRef.current !== reqId) return;
       setSelectedHand(hand);
+      setDetailError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load hand");
-      setSelectedHandId(null);
+      if (detailRequestRef.current !== reqId) return;
+      setDetailError(err instanceof Error ? err.message : "Failed to load hand");
     } finally {
-      setDetailLoading(false);
+      if (detailRequestRef.current === reqId) {
+        setDetailLoading(false);
+      }
     }
   };
 
@@ -354,6 +381,8 @@ function App() {
       setReplayerHand(hand);
       setSelectedHandId(handId);
       setSelectedHand(hand);
+      setDetailError(null);
+      setDetailLoading(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load hand for replayer");
     } finally {
@@ -362,8 +391,11 @@ function App() {
   };
 
   const closeDetail = () => {
+    detailRequestRef.current += 1;
     setSelectedHandId(null);
     setSelectedHand(null);
+    setDetailError(null);
+    setDetailLoading(false);
   };
 
   const positionStats =
@@ -566,6 +598,14 @@ function App() {
                   <HandDetailPanel
                     hand={selectedHand}
                     loading={detailLoading}
+                    error={detailError}
+                    onRetry={
+                      selectedHandId
+                        ? () => {
+                            if (selectedHandId) void openHand(selectedHandId);
+                          }
+                        : undefined
+                    }
                     onClose={closeDetail}
                     onOpenReplayer={() => {
                       if (selectedHand) setReplayerHand(selectedHand);
@@ -599,6 +639,9 @@ function App() {
             <AiCoachPanel
               dashboard={dashboard}
               recentHandIds={hands.map((h) => h.hand_id)}
+              sidecarOnline={sidecarOnline}
+              handsLoading={handsLoading}
+              totalHands={totalHands}
             />
           ) : null}
 

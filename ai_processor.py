@@ -1545,14 +1545,23 @@ def _friendly_api_error(exc: Exception, provider: str = "AI") -> str:
         x in low
         for x in ("429", "rate limit", "quota", "too many requests", "rate_limit")
     ) or (provider == "asi1" and "400" in low and "rate" in low):
+        reset_hint = ""
+        if provider == "asi1":
+            reset_match = re.search(
+                r"resets_at['\"]?\s*:\s*['\"]([^'\"]+)",
+                msg,
+                flags=re.IGNORECASE,
+            )
+            if reset_match:
+                reset_hint = f" Reset: {reset_match.group(1)}."
         extra = (
             " Check usage at https://asi1.ai (API dashboard)."
             if provider == "asi1"
             else ""
         )
         return (
-            f"{label} rate limit hit. Wait a minute and retry, or switch provider in Settings."
-            f"{extra}"
+            f"{label} rate limit hit.{reset_hint} Retry after the reset, or choose a different "
+            f"model/provider in Settings.{extra}"
         )
     if any(x in low for x in ("404", "model_not_found", "does not exist", "model not found")):
         hint = (
@@ -1886,6 +1895,30 @@ class AIProcessor:
     Local fallback: Ollama (last resort only)
     """
 
+    CONFIG_STALE_FIELDS = (
+        "ai_provider",
+        "ollama_model",
+        "db_path",
+        "ai_include_dataset_context",
+        "ai_include_web_context",
+        "ai_web_search_mode",
+        "ai_personalization",
+        "ai_agentic_tools",
+        "asi1_model",
+        "hero_names",
+        "coach_memory_db",
+        "coach_memory_hero",
+    )
+
+    # Explicit ASI1 dual-key workload routing (primary + fallback keys).
+    _ASI1_SPLIT_WORKLOADS: Dict[str, str] = {
+        "analysis": "primary",
+        "test": "primary",
+        "coach": "fallback",
+        "chat": "fallback",
+        "image": "fallback",
+    }
+
     def __init__(self, settings: dict = None, db_path: str = None):
         self._settings       = settings or {}
         self._db_path        = db_path or self._settings.get("db_path", _DEFAULT_DB)
@@ -2027,6 +2060,38 @@ class AIProcessor:
     def _asi1_any_ready(self) -> bool:
         return bool(self._asi1_client or self._asi1_client_fallback)
 
+    def _asi1_key_configured(self) -> bool:
+        return bool(_asi1_api_key(self._settings) or _asi1_api_key_fallback(self._settings))
+
+    def _cloud_keys_configured(self) -> bool:
+        """True when any cloud API key is present in .env (values never logged)."""
+        try:
+            from config import env_keys_detected
+
+            keys = env_keys_detected()
+            return bool(
+                keys.get("asi1")
+                or keys.get("openai")
+                or keys.get("gemini")
+                or keys.get("anthropic")
+                or keys.get("deepseek")
+            )
+        except ImportError:
+            return (
+                self._asi1_key_configured()
+                or bool(_deepseek_api_key(self._settings))
+                or bool(_gemini_api_key(self._settings))
+                or bool(self._settings.get("openai_api_key"))
+                or bool(self._settings.get("anthropic_api_key"))
+            )
+
+    def _should_skip_ollama_fallback(self, explicit: Optional[str] = None) -> bool:
+        """Never silently use local Ollama when cloud keys exist unless user chose Ollama."""
+        pref = (explicit or self._settings.get("ai_provider") or "asi1").lower()
+        if pref == "ollama":
+            return False
+        return self._cloud_keys_configured()
+
     def _asi1_split_mode(self) -> bool:
         return bool(self._asi1_client and self._asi1_client_fallback)
 
@@ -2038,7 +2103,8 @@ class AIProcessor:
             return None
         if not self._asi1_split_mode():
             return primary or fallback
-        if workload in ("analysis", "test"):
+        route = self._ASI1_SPLIT_WORKLOADS.get(workload, "fallback")
+        if route == "primary":
             return primary or fallback
         return fallback or primary
 
@@ -2758,10 +2824,21 @@ class AIProcessor:
             self._asi1_client_fallback = None
             self._asi1_fallback_key_fp = ""
 
-        if self._asi1_split_mode():
+        split_now = self._asi1_split_mode()
+        if split_now and not getattr(self, "_asi1_split_logged", False):
             log.info("[AI] ASI:One dual-key split — analysis on primary, coach on fallback")
-        elif asi1_key and HAS_OPENAI and self._asi1_client:
+            self._asi1_split_logged = True
+        elif not split_now:
+            self._asi1_split_logged = False
+        if (
+            not split_now
+            and asi1_key
+            and HAS_OPENAI
+            and self._asi1_client
+            and not getattr(self, "_asi1_ready_logged", False)
+        ):
             log.info("[AI] ASI:One ready — model: %s @ %s", ASI1_MODEL, ASI1_BASE_URL)
+            self._asi1_ready_logged = True
         elif asi1_key and not HAS_OPENAI:
             self._provider_init_errors.setdefault(
                 "asi1",
@@ -2799,7 +2876,10 @@ class AIProcessor:
         }
 
         if pref == "asi1":
-            chain = ["asi1", "openai", "deepseek", "gemini", "anthropic", "ollama"]
+            # ASI:One is a strict selection. Do not disguise an ASI1 failure by
+            # silently returning another provider's response or terminal error.
+            # Users who want automatic cloud fallback can explicitly choose Auto.
+            chain = ["asi1"]
         elif pref == "openai":
             chain = ["openai", "deepseek", "asi1", "gemini", "anthropic", "ollama"]
         elif pref == "deepseek":
@@ -2815,7 +2895,10 @@ class AIProcessor:
         else:
             chain = _cloud_first_chain(availability)
 
-        return [p for p in chain if availability.get(p, False)]
+        chain = [p for p in chain if availability.get(p, False)]
+        if self._should_skip_ollama_fallback(explicit):
+            chain = [p for p in chain if p != "ollama"]
+        return chain
 
     def _init(self):
         self._init_asi1_clients()
@@ -2952,6 +3035,60 @@ class AIProcessor:
             or self._gemini_ready
             or self._anthropic_client
         )
+
+    def config_matches(self, settings: dict, db_path: str) -> bool:
+        """True when cached settings/db_path still match the live configuration."""
+        if self._db_path != db_path:
+            return False
+        old = self._settings or {}
+        return all(old.get(k) == settings.get(k) for k in self.CONFIG_STALE_FIELDS)
+
+    def sync_provider_pref(self) -> None:
+        """Refresh cloud clients and align active provider with settings preference."""
+        self._refresh_cloud_clients()
+        pref = (self._settings.get("ai_provider") or "asi1").lower()
+        if pref not in ("asi1", "auto"):
+            return
+        chain = self._provider_chain()
+        if chain and chain[0] == "asi1" and self._asi1_any_ready():
+            self._active_provider = f"asi1:{self._asi1_chat_model()}"
+
+    def reload_from_env(self) -> dict:
+        """Re-read API keys from the environment and refresh provider clients."""
+        self._init()
+        return self.get_status_snapshot()
+
+    def last_web_context_used(self) -> bool:
+        return self._last_web_context_used
+
+    def provider_routing_info(self) -> Dict[str, Any]:
+        """Explicit ASI1 primary/fallback routing — single source for status/UI."""
+        split = self._asi1_split_mode()
+        workloads: Dict[str, str]
+        if split:
+            workloads = {
+                name: route
+                for name, route in self._ASI1_SPLIT_WORKLOADS.items()
+            }
+        else:
+            workloads = {name: "primary_or_single" for name in self._ASI1_SPLIT_WORKLOADS}
+        return {
+            "asi1_ready": self._asi1_any_ready(),
+            "asi1_primary_ready": bool(self._asi1_client),
+            "asi1_fallback_ready": bool(self._asi1_client_fallback),
+            "asi1_routing_mode": "split" if split else "single",
+            "asi1_dual_note": (
+                "Dual ASI1 keys: analysis + coach run in parallel"
+                if split
+                else None
+            ),
+            "asi1_model": self._asi1_chat_model(),
+            "asi1_chat_model": self._asi1_chat_model(),
+            "asi1_chat_models": ASI1_CHAT_MODELS,
+            "asi1_base_url": ASI1_BASE_URL,
+            "asi1_request_timeout_s": ASI1_REQUEST_TIMEOUT,
+            "asi1_workloads": workloads,
+        }
 
     def _provider_key_configured(self, name: str) -> Optional[bool]:
         """True/false if key-based; None for Ollama (no key)."""
@@ -3138,7 +3275,7 @@ class AIProcessor:
     def get_last_error(self) -> Optional[str]:
         return self._last_error
 
-    def get_status(self) -> dict:
+    def get_status_snapshot(self) -> dict:
         chain = self._provider_chain()
         ollama_running = _ollama_available()
         installed = sorted(_ollama_installed_models()) if ollama_running else []
@@ -3177,12 +3314,17 @@ class AIProcessor:
             "web_context_enabled": self._web_search_allowed(),
         }
         if self._include_dataset_context():
+            # Fast COUNT(*) only — full build_dataset_context() on status was blocking the
+            # coach UI for minutes on large DBs (4500+ hands).
             try:
-                ctx = self.get_dataset_context()
-                dataset_meta["dataset_context_ready"] = bool(ctx.get("hand_count"))
-                dataset_meta["dataset_context_hands"] = ctx.get("hand_count", 0)
+                from models import HandDatabase
+
+                hand_count = HandDatabase(self._db_path).count_hands()
+                dataset_meta["dataset_context_ready"] = hand_count > 0
+                dataset_meta["dataset_context_hands"] = hand_count
             except Exception:
                 pass
+        routing = self.provider_routing_info()
         return {
             "llm_available": llm_available,
             "llm_provider": llm_provider,
@@ -3190,24 +3332,9 @@ class AIProcessor:
             "ollama_model_pref_installed": pref_installed,
             "provider_chain": chain,
             "ai_provider_pref": self._settings.get("ai_provider", "asi1"),
-            "asi1_ready": self._asi1_any_ready(),
-            "asi1_primary_ready": bool(self._asi1_client),
-            "asi1_fallback_ready": bool(self._asi1_client_fallback),
-            "asi1_routing_mode": (
-                "split" if self._asi1_split_mode() else "single"
-            ),
-            "asi1_dual_note": (
-                "Dual ASI1 keys: analysis + coach run in parallel"
-                if self._asi1_split_mode()
-                else None
-            ),
-            "asi1_model": self._asi1_chat_model(),
-            "asi1_base_url": ASI1_BASE_URL,
-            "asi1_request_timeout_s": ASI1_REQUEST_TIMEOUT,
+            **routing,
             "asi1_image_ready": self.asi1_image_available(),
             "asi1_image_model": ASI1_IMAGE_MODEL,
-            "asi1_chat_model": self._asi1_chat_model(),
-            "asi1_chat_models": ASI1_CHAT_MODELS,
             "ai_personalization": self._personalization_on(),
             "ai_agentic_tools": self._agentic_tools_on(),
             "coach_memory_available": bool(HAS_COACH_MEMORY and self._memory),
@@ -3261,6 +3388,10 @@ class AIProcessor:
             "providers": self.get_provider_status(),
             **dataset_meta,
         }
+
+    def get_status(self) -> dict:
+        """Backward-compatible alias for :meth:`get_status_snapshot`."""
+        return self.get_status_snapshot()
 
     # ── Context / chat ────────────────────────────────────────────────────────
     def _include_dataset_context(self) -> bool:
@@ -3566,6 +3697,21 @@ class AIProcessor:
             system_prompt = f"{system_prompt}\n\n{WEB_ACCESS_NOTE}\n\n{web_block}"
         result = None
         used_prov = "none"
+        pref = (provider or self._settings.get("ai_provider") or "asi1").lower()
+        if (
+            self._asi1_key_configured()
+            and pref in ("asi1", "auto")
+            and not self._asi1_any_ready()
+        ):
+            self._refresh_cloud_clients()
+            if not self._asi1_any_ready():
+                err = self._provider_init_errors.get("asi1") or (
+                    "ASI_ONE_API_KEY is set but ASI:One failed to initialize — "
+                    "check sidecar log or Settings → Refresh AI keys"
+                )
+                self._last_error = err
+                log.warning("[AI] analyze_hand blocked: %s", err)
+                return None
 
         for prov in self._provider_chain(provider):
             try:

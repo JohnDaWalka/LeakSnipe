@@ -15,6 +15,17 @@ export default defineConfig(async () => ({
         main: resolve(__dirname, "index.html"),
         hud: resolve(__dirname, "hud.html"),
       },
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules')) {
+            if (id.includes('react') || id.includes('react-dom') || id.includes('scheduler'))
+              return 'vendor-react';
+            if (id.includes('@tauri-apps') || id.includes('@tauri'))
+              return 'vendor-tauri';
+            return 'vendor';
+          }
+        }
+      }
     },
   },
 

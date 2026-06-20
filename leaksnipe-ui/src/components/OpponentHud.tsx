@@ -57,7 +57,9 @@ function PlayerHudBadge({
   compact?: boolean;
 }) {
   const playerType = stats.effective_type || stats.auto_type || "Unknown";
-  const [showTooltip, setShowTooltip] = useState(false);
+  const [hovered, setHovered] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const showTooltip = hovered || pinned;
   const positions = useMemo(() => {
     const rows = Object.entries(stats.by_position ?? {})
       .filter(([, d]) => (d.hands ?? 0) > 0)
@@ -68,8 +70,19 @@ function PlayerHudBadge({
   return (
     <div
       className={`hud-badge ${compact ? "compact" : ""}`}
-      onMouseEnter={() => setShowTooltip(true)}
-      onMouseLeave={() => setShowTooltip(false)}
+      role="button"
+      tabIndex={0}
+      aria-expanded={showTooltip}
+      aria-label={`${stats.name} opponent statistics`}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      onClick={() => setPinned((current) => !current)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          setPinned((current) => !current);
+        }
+      }}
     >
       <div className="hud-badge-name" title={stats.name}>
         {stats.name}
@@ -157,33 +170,42 @@ export function OpponentHudPanel({ names, compact, title = "Opponent HUD" }: Opp
     () => [...new Set(names.map((n) => n.trim()).filter(Boolean))],
     [names],
   );
+  const uniqueNamesKey = uniqueNames.join("\u0000");
 
   useEffect(() => {
-    if (uniqueNames.length === 0) {
+    const requestedNames = uniqueNamesKey ? uniqueNamesKey.split("\u0000") : [];
+    if (requestedNames.length === 0) {
       setStatsMap({});
       return;
     }
     let cancelled = false;
-    setLoading(true);
-    setError(null);
-    api
-      .playerStatsBatch(uniqueNames)
-      .then((res) => {
-        if (!cancelled) setStatsMap(res.players);
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Failed to load HUD stats");
-          setStatsMap({});
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+    const loadStats = (showSpinner: boolean) => {
+      if (showSpinner) setLoading(true);
+      setError(null);
+      void api
+        .playerStatsBatch(requestedNames)
+        .then((res) => {
+          if (!cancelled) setStatsMap(res.players);
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            setError(err instanceof Error ? err.message : "Failed to load HUD stats");
+          }
+        })
+        .finally(() => {
+          if (!cancelled && showSpinner) setLoading(false);
+        });
+    };
+    loadStats(true);
+    const refreshOnFocus = () => loadStats(false);
+    const refreshTimer = window.setInterval(() => loadStats(false), 30_000);
+    window.addEventListener("focus", refreshOnFocus);
     return () => {
       cancelled = true;
+      window.clearInterval(refreshTimer);
+      window.removeEventListener("focus", refreshOnFocus);
     };
-  }, [uniqueNames.join("|")]);
+  }, [uniqueNamesKey]);
 
   if (uniqueNames.length === 0) return null;
 

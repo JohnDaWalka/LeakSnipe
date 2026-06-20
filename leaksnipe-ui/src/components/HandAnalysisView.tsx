@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { AiAnalysis } from "../lib/api";
 import { formatAiProviderLabel } from "../lib/api";
+import { parseCardList, PlayingCard } from "./PlayingCard";
 
 type HandAnalysisViewProps = {
   analysis: AiAnalysis;
@@ -98,6 +99,13 @@ export function HandAnalysisView({ analysis, compact = false }: HandAnalysisView
                   </div>
                 ) : null}
                 {street.comment ? <p className="analysis-street-comment">{street.comment}</p> : null}
+                {open && street.board ? (
+                  <div className="analysis-street-board card-row">
+                    {parseCardList(street.board).map((c, cardIdx) => (
+                      <PlayingCard key={`${key}-card-${cardIdx}`} card={c} small />
+                    ))}
+                  </div>
+                ) : null}
                 {open && streetActions.length > 0 ? (
                   <ul className="analysis-action-list">
                     {streetActions.map((act, actIdx) => (

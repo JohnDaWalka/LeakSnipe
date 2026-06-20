@@ -302,7 +302,7 @@ class HandImporter:
         while not self._stop.is_set():
             try:
                 new_count, file_count = self.full_scan()
-                if callback and new_count > 0:
+                if callback:
                     callback(new_count, file_count)
             except Exception as e:
                 logging.error(f"Error in watch loop: {e}", exc_info=True)

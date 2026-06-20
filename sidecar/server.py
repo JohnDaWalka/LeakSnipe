@@ -8,11 +8,12 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import sys
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,6 +37,7 @@ import pot_odds as pot_odds_engine  # noqa: E402
 from analysis import LeakEngine, PlayerAnalyzer, SummaryGenerator, player_stats_payload  # noqa: E402
 from config import ENV_PATH, bootstrap_env, env_keys_detected, get_api_key, load_settings, save_settings  # noqa: E402
 from dataset_context import invalidate_dataset_context_cache  # noqa: E402
+from db_migrations import schema_diagnostics  # noqa: E402
 from importing import HandImporter, discover_scan_dirs, merge_scan_dirs  # noqa: E402
 from models import HandDatabase  # noqa: E402
 from parsers import HandParser  # noqa: E402
@@ -47,6 +49,7 @@ API_PORT = int(os.environ.get("LEAKSNIPE_API_PORT", "8765"))
 API_HOST = os.environ.get("LEAKSNIPE_API_HOST", "127.0.0.1")
 API_VERSION = "0.2.0"
 STATS_CACHE_TTL_SEC = 45
+SIDECAR_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 _log_handlers: list[logging.Handler] = [logging.StreamHandler()]
 _sidecar_log = os.environ.get("LEAKSNIPE_SIDECAR_LOG")
@@ -87,12 +90,17 @@ _ai_lock = threading.Lock()
 
 def _env_fingerprint() -> tuple:
     """Detect .env key presence and value changes without exposing secrets."""
+    from config import get_asi1_fallback_api_key
+
     base = tuple(sorted(env_keys_detected().items()))
     digests = tuple(
         (prov, hashlib.sha256(key.encode()).hexdigest()[:12])
         for prov in ("asi1", "openai", "gemini", "anthropic", "deepseek")
         if (key := get_api_key(prov))
     )
+    fallback = get_asi1_fallback_api_key()
+    if fallback:
+        digests = digests + (("asi1_fallback", hashlib.sha256(fallback.encode()).hexdigest()[:12]),)
     return base + digests
 
 
@@ -100,33 +108,12 @@ def _ai_is_stale(*, reload_env: bool = False) -> tuple[bool, Dict[str, Any], str
     if reload_env:
         bootstrap_env(reload_file=True)
     settings = load_settings()
-    pref_fields = (
-        "ai_provider", "ollama_model", "db_path",
-        "ai_include_dataset_context", "ai_include_web_context", "ai_web_search_mode",
-        "ai_personalization", "ai_agentic_tools", "asi1_model", "hero_names",
-        "coach_memory_db", "coach_memory_hero",
-    )
     db_path = resolve_db_path(settings)
     fp = _env_fingerprint()
     stale = _ai_processor is None or _ai_env_fingerprint != fp
-    if not stale:
-        old = _ai_processor._settings or {}
-        stale = _ai_processor._db_path != db_path or any(
-            old.get(k) != settings.get(k) for k in pref_fields
-        )
+    if not stale and not _ai_processor.config_matches(settings, db_path):
+        stale = True
     return stale, settings, db_path, fp
-
-
-def _apply_ai_provider_pref(processor, settings: Dict[str, Any]) -> None:
-    processor._refresh_cloud_clients()
-    if processor._asi1_client:
-        pref = (settings.get("ai_provider") or "asi1").lower()
-        if pref in ("asi1", "auto"):
-            chain = processor._provider_chain()
-            if chain and chain[0] == "asi1":
-                from ai_processor import ASI1_MODEL
-
-                processor._active_provider = f"asi1:{ASI1_MODEL}"
 
 
 def _get_ai(*, reload_env: bool = False):
@@ -134,20 +121,16 @@ def _get_ai(*, reload_env: bool = False):
     with _ai_lock:
         stale, settings, db_path, fp = _ai_is_stale(reload_env=reload_env)
         if not stale:
-            _apply_ai_provider_pref(_ai_processor, settings)
+            _ai_processor.sync_provider_pref()
             return _ai_processor
 
-    from ai_processor import AIProcessor
+        from ai_processor import AIProcessor
 
-    built = AIProcessor(settings=settings, db_path=db_path)
-    with _ai_lock:
-        stale, settings, db_path, fp = _ai_is_stale(reload_env=False)
-        if stale:
-            _ai_env_fingerprint = fp
-            _ai_processor = built
-        processor = _ai_processor
-        _apply_ai_provider_pref(processor, settings)
-        return processor
+        built = AIProcessor(settings=settings, db_path=db_path)
+        _ai_env_fingerprint = fp
+        _ai_processor = built
+        _ai_processor.sync_provider_pref()
+        return _ai_processor
 
 
 def _reset_ai():
@@ -505,7 +488,41 @@ async def health() -> Dict[str, Any]:
     # Must stay async so health is served on the event loop, not the sync thread pool.
     # When AI/theory/import work saturates thread workers, sync /health never runs and the UI
     # falsely reports the sidecar offline (or start-sidecar.ps1 kills a busy listener).
-    return {"status": "ok", "api_version": API_VERSION}
+    return {
+        "status": "ok",
+        "api_version": API_VERSION,
+        "pid": os.getpid(),
+        "started_at": SIDECAR_STARTED_AT,
+    }
+
+
+@app.get("/api/diagnostics")
+def diagnostics() -> Dict[str, Any]:
+    """Non-secret runtime identity and persistence health for support/debugging."""
+    db = _get_db()
+    db_path = os.path.abspath(db.db_path)
+    with db.lock:
+        conn = db._connect()
+        try:
+            schema = schema_diagnostics(conn)
+            hand_count = int(conn.execute("SELECT COUNT(*) FROM hands").fetchone()[0])
+        finally:
+            conn.close()
+    return {
+        "ok": True,
+        "api_version": API_VERSION,
+        "pid": os.getpid(),
+        "started_at": SIDECAR_STARTED_AT,
+        "python_version": platform.python_version(),
+        "project_root": _REPO_ROOT,
+        "database": {
+            "path": db_path,
+            "exists": os.path.isfile(db_path),
+            "size_bytes": os.path.getsize(db_path) if os.path.isfile(db_path) else 0,
+            "hand_count": hand_count,
+            "schema": schema,
+        },
+    }
 
 
 @app.get("/api/dashboard")
@@ -862,8 +879,8 @@ def _run_hand_analysis(hand_id: str, provider: Optional[str] = None) -> Dict[str
         "analysis": result,
         "provider": result.get("provider"),
         "model": result.get("model"),
-        "dataset_context_hands": processor.get_status().get("dataset_context_hands", 0),
-        "dataset_context_included": processor.get_status().get("ai_include_dataset_context", True),
+        "dataset_context_hands": processor.get_status_snapshot().get("dataset_context_hands", 0),
+        "dataset_context_included": processor.get_status_snapshot().get("ai_include_dataset_context", True),
         "web_context_included": bool(result.get("web_context_included")),
     }
 
@@ -872,7 +889,8 @@ def _ai_setup_hint(processor, keys: Dict[str, bool]) -> Optional[str]:
     """User-facing hint when no LLM is available (no secret values)."""
     if processor.is_available():
         return None
-    pref = processor.get_status().get("ai_provider_pref", "auto")
+    status = processor.get_status_snapshot()
+    pref = str(status.get("ai_provider_pref") or "asi1").lower()
     if keys.get("asi1"):
         return (
             "ASI_ONE_API_KEY detected — set Settings → AI provider → ASI:One (or Auto) "
@@ -945,7 +963,7 @@ def ai_reload() -> Dict[str, Any]:
         _reset_ai()
         processor = _get_ai(reload_env=True)
         keys = env_keys_detected()
-        status = processor.get_status()
+        status = processor.get_status_snapshot()
         return {
             "ok": True,
             **status,
@@ -972,9 +990,10 @@ def ai_reload() -> Dict[str, Any]:
 @app.get("/api/ai/status")
 def ai_status() -> Dict[str, Any]:
     try:
-        processor = _get_ai()
+        bootstrap_env(reload_file=True)
+        processor = _get_ai(reload_env=True)
         keys = env_keys_detected()
-        status = processor.get_status()
+        status = processor.get_status_snapshot()
         return {
             "ok": True,
             **status,
@@ -1039,14 +1058,14 @@ def analyze_session(body: AnalyzeSessionRequest | None = None) -> Dict[str, Any]
         stats=stats,
         provider=body.provider,
     )
-    status = processor.get_status()
+    status = processor.get_status_snapshot()
     return {
         "ok": True,
         "report": report,
         "hands_analyzed": len(sample),
         "dataset_context_hands": status.get("dataset_context_hands", 0),
         "dataset_context_included": status.get("ai_include_dataset_context", True),
-        "web_context_included": processor._last_web_context_used,
+        "web_context_included": processor.last_web_context_used(),
     }
 
 
@@ -1059,12 +1078,12 @@ def chat(body: ChatRequest) -> Dict[str, Any]:
     if body.clear:
         processor.clear_chat()
     reply = processor.chat(body.message, provider=body.provider)
-    status = processor.get_status()
+    status = processor.get_status_snapshot()
     return {
         "ok": True,
         "reply": reply,
         "provider": status.get("llm_provider"),
-        "web_context_included": processor._last_web_context_used,
+        "web_context_included": processor.last_web_context_used(),
     }
 
 

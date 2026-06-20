@@ -81,9 +81,66 @@ function Stop-SidecarOnPort {
 }
 
 $logPath = Join-Path $env:TEMP "leaksnipe_sidecar.log"
+$lockPath = Join-Path $env:TEMP "leaksnipe_sidecar.start.lock"
+
+function Enter-SidecarStartLock {
+    param([int]$TimeoutSec = 90)
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $script:SidecarStartLock = [System.IO.File]::Open(
+                $lockPath,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+            return $true
+        } catch {
+            if (Test-SidecarHealthy) {
+                Write-Host "Sidecar became healthy while another launch was in progress"
+                return $false
+            }
+            Start-Sleep -Milliseconds 400
+        }
+    }
+    Write-Warning "Timed out waiting for sidecar start lock ($lockPath)"
+    return $false
+}
+
+function Exit-SidecarStartLock {
+    if ($script:SidecarStartLock) {
+        $script:SidecarStartLock.Dispose()
+        $script:SidecarStartLock = $null
+    }
+}
 
 Set-Location $root
 
+if (Test-SidecarHealthy) {
+    Write-Host "Sidecar already healthy on port $port"
+    exit 0
+}
+
+if (Test-SidecarProcessOnPort) {
+    Write-Host "LeakSnipe sidecar already listening on port $port - waiting for /health..."
+    for ($i = 0; $i -lt 80; $i++) {
+        Start-Sleep -Milliseconds 500
+        if (Test-SidecarHealthy) {
+            Write-Host "Sidecar became healthy on port $port"
+            exit 0
+        }
+    }
+}
+
+if (-not (Enter-SidecarStartLock)) {
+    if (Test-SidecarHealthy) {
+        Write-Host "Sidecar already healthy on port $port"
+        exit 0
+    }
+    exit 1
+}
+
+try {
 if (Test-SidecarHealthy) {
     Write-Host "Sidecar already healthy on port $port"
     exit 0
@@ -93,14 +150,14 @@ $listener = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction Sil
 if ($listener) {
     if (Test-SidecarProcessOnPort) {
         Write-Host "Port $port owned by LeakSnipe sidecar - waiting for health (may be busy during startup)..."
-        for ($i = 0; $i -lt 60; $i++) {
+        for ($i = 0; $i -lt 80; $i++) {
             Start-Sleep -Milliseconds 500
             if (Test-SidecarHealthy) {
                 Write-Host "Sidecar became healthy on port $port"
                 exit 0
             }
         }
-        Write-Host "LeakSnipe sidecar on port $port not responding - stopping hung listener..."
+        Write-Host "LeakSnipe sidecar on port $port not responding after 40s - stopping hung listener..."
         Stop-SidecarOnPort -LeakSnipeOnly
     } else {
         Write-Host "Port $port in use but health check failed - waiting for sidecar..."
@@ -166,3 +223,6 @@ for ($i = 0; $i -lt 80; $i++) {
 
 Write-Warning "Sidecar did not become healthy within 40s (pid $($proc.Id)). Check $logPath"
 exit 1
+} finally {
+    Exit-SidecarStartLock
+}

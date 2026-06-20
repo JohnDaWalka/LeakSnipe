@@ -764,6 +764,32 @@ export type SidecarStatus = {
   port: number;
   log_path: string;
   last_error: string;
+  ownership: "tauri-managed" | "external-launcher" | "none" | "unknown";
+  pid: number | null;
+  restart_failures: number;
+  app_version: string;
+  repo_root: string;
+};
+
+export type RuntimeDiagnostics = {
+  ok: boolean;
+  api_version: string;
+  pid: number;
+  started_at: string;
+  python_version: string;
+  project_root: string;
+  database: {
+    path: string;
+    exists: boolean;
+    size_bytes: number;
+    hand_count: number;
+    schema: {
+      current_version: number;
+      database_version: number;
+      migration_count: number;
+      position_fact_count: number;
+    };
+  };
 };
 
 export async function getSidecarStatus(): Promise<SidecarStatus | null> {
@@ -838,7 +864,23 @@ function normalizeHandDetail(
   return rest as HandDetail;
 }
 
+/** Minimal detail shell so the drawer can show list cards while full hand loads. */
+export function handSummaryToDetailPreview(summary: HandSummary): HandDetail {
+  return {
+    ...summary,
+    board_cards: [],
+    streets: [],
+    players: {},
+    winners: [],
+    raw_text: "",
+    max_seats: 6,
+    button_seat: 0,
+    rake: 0,
+  };
+}
+
 export const api = {
+  diagnostics: () => apiFetch<RuntimeDiagnostics>("/api/diagnostics"),
   dashboard: (wait = false, signal?: AbortSignal) =>
     apiFetch<Dashboard>(`/api/dashboard${wait ? "?wait=true" : ""}`, {
       timeoutMs: wait ? 45_000 : STARTUP_FETCH_TIMEOUT_MS,
@@ -858,9 +900,10 @@ export const api = {
       timeoutMs: STARTUP_FETCH_TIMEOUT_MS,
       signal,
     }),
-  hand: async (id: string) => {
+  hand: async (id: string, signal?: AbortSignal) => {
     const res = await apiFetch<{ ok?: boolean; hand?: HandDetail } & Partial<HandDetail>>(
       `/api/hands/${encodeURIComponent(id)}`,
+      { timeoutMs: STARTUP_FETCH_TIMEOUT_MS, signal },
     );
     return { ok: true, hand: normalizeHandDetail(res) };
   },

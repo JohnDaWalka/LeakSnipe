@@ -11,6 +11,8 @@ from datetime import datetime
 from collections import defaultdict, OrderedDict
 import logging
 
+from db_migrations import apply_migrations, read_player_position_stats, refresh_hand_position_facts
+
 
 class Hand:
     """Represents a single poker hand with players, actions, and results."""
@@ -160,6 +162,7 @@ class HandDatabase:
                     CREATE INDEX IF NOT EXISTS idx_hand_tags_tag ON hand_tags(tag);
                     CREATE INDEX IF NOT EXISTS idx_hand_tags_hand_id ON hand_tags(hand_id);
                 """)
+                apply_migrations(conn)
                 conn.commit()
             finally:
                 conn.close()
@@ -261,6 +264,7 @@ class HandDatabase:
                         "INSERT INTO winners (hand_id, player_name, amount) VALUES (?,?,?)",
                         (hand.hand_id, w["name"], w["amount"]),
                     )
+                refresh_hand_position_facts(conn, hand.hand_id)
                 conn.commit()
             finally:
                 conn.close()
@@ -706,46 +710,12 @@ class HandDatabase:
 
     def get_player_position_stats(self, name: str) -> Dict[str, Dict[str, float]]:
         """Get per-position VPIP/PFR statistics for a player."""
-        POSITIONS = ["UTG", "UTG+1", "UTG+2", "MP", "HJ", "CO", "BTN", "SB", "BB"]
-        result = {p: {"pfr": 0.0, "vpip": 0.0, "hands": 0} for p in POSITIONS}
         with self.lock:
             conn = self._connect()
             try:
-                rows = conn.execute("""
-                    SELECT p.hand_id, p.seat, h.button_seat
-                    FROM players p JOIN hands h ON p.hand_id = h.hand_id
-                    WHERE p.name = ? AND p.is_hero = 0
-                """, (name,)).fetchall()
-                for row in rows:
-                    hand_id, seat, button_seat = row[0], row[1], row[2]
-                    all_seats = [r[0] for r in conn.execute(
-                        "SELECT seat FROM players WHERE hand_id=? ORDER BY seat", (hand_id,)).fetchall()]
-                    if not all_seats or button_seat not in all_seats or seat not in all_seats:
-                        continue
-                    n = len(all_seats)
-                    dist = (all_seats.index(seat) - all_seats.index(button_seat)) % n
-                    if   dist == 0:                       pos = "BTN"
-                    elif dist == 1:                       pos = "SB"
-                    elif dist == 2:                       pos = "BB"
-                    elif dist == n - 1:                   pos = "CO"
-                    elif n >= 5 and dist == n - 2:        pos = "HJ"
-                    elif n >= 6 and dist == n - 3:        pos = "MP"
-                    elif n >= 7 and dist == n - 4:        pos = "UTG+2"
-                    elif n >= 8 and dist == n - 5:        pos = "UTG+1"
-                    else:                                 pos = "UTG"
-                    result[pos]["hands"] += 1
-                    if conn.execute("SELECT 1 FROM actions WHERE hand_id=? AND player=? AND street='preflop' AND action IN ('call','raise','bet') LIMIT 1", (hand_id, name)).fetchone():
-                        result[pos]["vpip"] += 1
-                    if conn.execute("SELECT 1 FROM actions WHERE hand_id=? AND player=? AND street='preflop' AND action IN ('raise','bet') LIMIT 1", (hand_id, name)).fetchone():
-                        result[pos]["pfr"] += 1
+                return read_player_position_stats(conn, name)
             finally:
                 conn.close()
-        for pos in POSITIONS:
-            h = result[pos]["hands"]
-            if h > 0:
-                result[pos]["vpip"] = round(result[pos]["vpip"] / h * 100, 1)
-                result[pos]["pfr"]  = round(result[pos]["pfr"]  / h * 100, 1)
-        return result
 
     def get_all_player_types(self) -> List[Dict[str, Any]]:
         """Get all player types with statistics."""

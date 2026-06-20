@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   api,
+  getSidecarStatus,
   waitForBackend,
   type AiProviderTestResult,
   type AiStatus,
+  type RuntimeDiagnostics,
   type ScanDir,
   type Settings,
+  type SidecarStatus,
 } from "../lib/api";
 import {
   diagnoseLiveHud,
@@ -19,6 +22,12 @@ import {
 
 const SITE_OPTIONS = ["BetACR", "ACR", "CoinPoker", "GGPoker", "ReplayPoker"];
 const OLLAMA_RECOMMENDED_MODELS = ["deepseek-r1:8b", "qwen2.5:7b"] as const;
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 const AI_PROVIDERS = [
   { id: "asi1", label: "ASI:One (cloud — recommended)", envVar: "ASI_ONE_API_KEY" },
@@ -51,6 +60,10 @@ export function SettingsPanel({ settings, folders, onSaved }: SettingsPanelProps
   const [hudDiag, setHudDiag] = useState<HudDiagnostics | null>(null);
   const [hudDiagError, setHudDiagError] = useState<string | null>(null);
   const [sidecarOk, setSidecarOk] = useState<boolean | null>(null);
+  const [sidecarStatus, setSidecarStatus] = useState<SidecarStatus | null>(null);
+  const [runtimeDiag, setRuntimeDiag] = useState<RuntimeDiagnostics | null>(null);
+  const [runtimeDiagError, setRuntimeDiagError] = useState<string | null>(null);
+  const [runtimeDiagLoading, setRuntimeDiagLoading] = useState(false);
   const [pythonHudLaunching, setPythonHudLaunching] = useState(false);
   const [pythonHudStopping, setPythonHudStopping] = useState(false);
   const [pythonHudRunning, setPythonHudRunning] = useState(false);
@@ -70,6 +83,27 @@ export function SettingsPanel({ settings, folders, onSaved }: SettingsPanelProps
     }
   }, []);
 
+  const loadRuntimeDiagnostics = useCallback(async () => {
+    setRuntimeDiagLoading(true);
+    setRuntimeDiagError(null);
+    try {
+      await waitForBackend();
+      const [status, diagnostics] = await Promise.all([
+        getSidecarStatus(),
+        api.diagnostics(),
+      ]);
+      setSidecarStatus(status);
+      setRuntimeDiag(diagnostics);
+      setSidecarOk(true);
+    } catch (err) {
+      setRuntimeDiag(null);
+      setSidecarOk(false);
+      setRuntimeDiagError(err instanceof Error ? err.message : "Diagnostics unavailable");
+    } finally {
+      setRuntimeDiagLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     void loadAiStatus();
   }, [loadAiStatus]);
@@ -79,15 +113,8 @@ export function SettingsPanel({ settings, folders, onSaved }: SettingsPanelProps
   }, [settings]);
 
   useEffect(() => {
-    void (async () => {
-      try {
-        await waitForBackend();
-        setSidecarOk(true);
-      } catch {
-        setSidecarOk(false);
-      }
-    })();
-  }, []);
+    void loadRuntimeDiagnostics();
+  }, [loadRuntimeDiagnostics]);
 
   const runHudTest = async () => {
     setHudTesting(true);
@@ -556,6 +583,14 @@ export function SettingsPanel({ settings, folders, onSaved }: SettingsPanelProps
                 Reset HUD seat positions
               </button>
             ) : null}
+            <button
+              type="button"
+              className="secondary-btn"
+              onClick={() => void loadRuntimeDiagnostics()}
+              disabled={runtimeDiagLoading}
+            >
+              {runtimeDiagLoading ? "Refreshing…" : "Refresh diagnostics"}
+            </button>
           </div>
           <p className="field-hint">
             CLI: <span className="mono">python poker_gui.py --live-hud</span> or{" "}
@@ -569,6 +604,40 @@ export function SettingsPanel({ settings, folders, onSaved }: SettingsPanelProps
               Sidecar (8765):{" "}
               {sidecarOk === null ? "checking…" : sidecarOk ? "OK" : "not reachable"}
             </li>
+            {sidecarStatus ? (
+              <>
+                <li>
+                  Runtime owner: {sidecarStatus.ownership}
+                  {sidecarStatus.pid ? ` · PID ${sidecarStatus.pid}` : ""}
+                  {` · restarts failed ${sidecarStatus.restart_failures}`}
+                </li>
+                <li>
+                  Desktop build: {sidecarStatus.app_version} · repository: {sidecarStatus.repo_root}
+                </li>
+                <li>Sidecar log: {sidecarStatus.log_path}</li>
+              </>
+            ) : null}
+            {runtimeDiag ? (
+              <>
+                <li>
+                  API {runtimeDiag.api_version} · PID {runtimeDiag.pid} · Python{" "}
+                  {runtimeDiag.python_version}
+                </li>
+                <li>
+                  API started: {new Date(runtimeDiag.started_at).toLocaleString()}
+                </li>
+                <li>
+                  Database: {runtimeDiag.database.hand_count.toLocaleString()} hands ·{" "}
+                  {formatBytes(runtimeDiag.database.size_bytes)} · {runtimeDiag.database.path}
+                </li>
+                <li>
+                  Schema: v{runtimeDiag.database.schema.database_version}/
+                  {runtimeDiag.database.schema.current_version} ·{" "}
+                  {runtimeDiag.database.schema.migration_count} migrations ·{" "}
+                  {runtimeDiag.database.schema.position_fact_count.toLocaleString()} positional facts
+                </li>
+              </>
+            ) : null}
             <li>HUD engine: {useTauriHud ? "Tauri (experimental)" : "Python (recommended)"}</li>
             <li>Live HUD enabled in settings: {draft.live_hud_enabled ? "yes" : "no"}</li>
             {!useTauriHud ? (
@@ -589,6 +658,7 @@ export function SettingsPanel({ settings, folders, onSaved }: SettingsPanelProps
               </>
             ) : null}
           </ul>
+          {runtimeDiagError ? <div className="error-banner">{runtimeDiagError}</div> : null}
           {hudDiagError ? <div className="error-banner">{hudDiagError}</div> : null}
           {useTauriHud && !hudDiagError && hudDiag?.overlay_exists ? (
             <p className="field-hint">

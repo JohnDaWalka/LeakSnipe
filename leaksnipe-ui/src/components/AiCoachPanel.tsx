@@ -40,9 +40,52 @@ type ChatMessage = { role: "user" | "assistant"; content: string };
 type AiCoachPanelProps = {
   dashboard: Dashboard | null;
   recentHandIds: string[];
+  sidecarOnline: boolean | null;
+  handsLoading: boolean;
+  totalHands: number;
 };
 
-export function AiCoachPanel({ dashboard, recentHandIds }: AiCoachPanelProps) {
+const AI_STATUS_PROBE_MS = 25_000;
+
+function coachActionTitle(
+  kind: "session" | "hand",
+  opts: {
+    sidecarUp: boolean;
+    hasHands: boolean;
+    handsLoading: boolean;
+    statusLoading: boolean;
+    aiKnownUnavailable: boolean;
+    busy: boolean;
+  },
+): string | undefined {
+  if (!opts.sidecarUp) {
+    return "Python sidecar offline — use Start Sidecar in the banner above";
+  }
+  if (opts.busy) {
+    return kind === "session" ? "Session analysis in progress…" : "Hand analysis in progress…";
+  }
+  if (kind === "hand" && opts.handsLoading && !opts.hasHands) {
+    return "Loading hands from database…";
+  }
+  if (kind === "hand" && !opts.hasHands) {
+    return "No hands in database — import hand histories in Settings";
+  }
+  if (opts.statusLoading) {
+    return "Checking AI provider status…";
+  }
+  if (opts.aiKnownUnavailable) {
+    return "No AI provider ready — add ASI_ONE_API_KEY or start Ollama, then Refresh";
+  }
+  return undefined;
+}
+
+export function AiCoachPanel({
+  dashboard,
+  recentHandIds,
+  sidecarOnline,
+  handsLoading,
+  totalHands,
+}: AiCoachPanelProps) {
   const [status, setStatus] = useState<AiStatus | null>(null);
   const [sessionReport, setSessionReport] = useState<string | null>(null);
   const [handAnalysis, setHandAnalysis] = useState<AiAnalysis | null>(null);
@@ -63,7 +106,14 @@ export function AiCoachPanel({ dashboard, recentHandIds }: AiCoachPanelProps) {
     setRefreshingStatus(true);
     try {
       await waitForBackend(24, 250);
-      const s = reloadKeys ? await api.aiReload() : await api.aiStatus();
+      const statusPromise = reloadKeys ? api.aiReload() : api.aiStatus();
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        window.setTimeout(
+          () => reject(new Error("AI status check timed out — you can still try Analyze below")),
+          AI_STATUS_PROBE_MS,
+        );
+      });
+      const s = await Promise.race([statusPromise, timeoutPromise]);
       setStatus(s);
       if (s.ai_provider_pref) setProviderPref(s.ai_provider_pref);
       if (s.dataset_context_hands != null) setDatasetHands(s.dataset_context_hands);
@@ -77,8 +127,13 @@ export function AiCoachPanel({ dashboard, recentHandIds }: AiCoachPanelProps) {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      setStatus({ ok: false, llm_available: false, llm_provider: "none", ollama_ready: false });
-      setError(message);
+      if (message.includes("timed out")) {
+        // Sidecar is up; don't leave coach actions blocked while status is slow.
+        setError(message);
+      } else {
+        setStatus({ ok: false, llm_available: false, llm_provider: "none", ollama_ready: false });
+        setError(message);
+      }
     } finally {
       setRefreshingStatus(false);
     }
@@ -104,9 +159,14 @@ export function AiCoachPanel({ dashboard, recentHandIds }: AiCoachPanelProps) {
   }, [messages]);
 
   const runSession = async () => {
+    if (!sidecarUp) {
+      setError("Python sidecar offline — start it from the banner above");
+      return;
+    }
     setLoading("session");
     setError(null);
     try {
+      await waitForBackend(24, 250);
       const res = await api.analyzeSession(20, providerPref === "auto" ? undefined : providerPref);
       setSessionReport(res.report);
     } catch (err) {
@@ -117,14 +177,19 @@ export function AiCoachPanel({ dashboard, recentHandIds }: AiCoachPanelProps) {
   };
 
   const runRecentHand = async () => {
-    const handId = recentHandIds[0];
-    if (!handId) {
-      setError("No hands loaded to analyze");
-      return;
-    }
     setLoading("hand");
     setError(null);
     try {
+      await waitForBackend(24, 250);
+      let handId = recentHandIds[0];
+      if (!handId && (totalHands > 0 || (dashboard?.total_hands ?? 0) > 0)) {
+        const recent = await api.recentHands(1);
+        handId = recent.hands?.[0]?.hand_id;
+      }
+      if (!handId) {
+        setError("No hands loaded to analyze — import hand histories in Settings");
+        return;
+      }
       const res = await api.analyzeHand(
         handId,
         providerPref === "auto" ? undefined : providerPref,
@@ -246,6 +311,33 @@ export function AiCoachPanel({ dashboard, recentHandIds }: AiCoachPanelProps) {
     status?.ai_personalization !== false && Boolean(status?.coach_memory_available);
   const agenticToolsOn = status?.ai_agentic_tools !== false;
   const memoryHero = status?.coach_memory_hero;
+
+  const sidecarUp = sidecarOnline !== false;
+  const hasHands =
+    recentHandIds.length > 0 || totalHands > 0 || (dashboard?.total_hands ?? 0) > 0;
+  const statusLoading = refreshingStatus && !status;
+  const aiKnownUnavailable = Boolean(status && !available);
+  const sessionBusy = loading === "session";
+  const handBusy = loading === "hand";
+  const sessionDisabled = !sidecarUp || sessionBusy || aiKnownUnavailable;
+  const handDisabled =
+    !sidecarUp || !hasHands || handBusy || (handsLoading && !hasHands) || aiKnownUnavailable;
+  const sessionTitle = coachActionTitle("session", {
+    sidecarUp,
+    hasHands,
+    handsLoading,
+    statusLoading,
+    aiKnownUnavailable,
+    busy: sessionBusy,
+  });
+  const handTitle = coachActionTitle("hand", {
+    sidecarUp,
+    hasHands,
+    handsLoading,
+    statusLoading,
+    aiKnownUnavailable,
+    busy: handBusy,
+  });
 
   return (
     <div className="ai-coach-panel">
@@ -424,20 +516,30 @@ export function AiCoachPanel({ dashboard, recentHandIds }: AiCoachPanelProps) {
         </label>
         <button
           type="button"
-          className="secondary-btn"
-          onClick={runSession}
-          disabled={!available || loading === "session"}
+          className="secondary-btn coach-action-btn"
+          onClick={() => void runSession()}
+          disabled={sessionDisabled}
+          title={sessionTitle}
+          aria-disabled={sessionDisabled}
         >
-          {loading === "session" ? "Analyzing session…" : "Analyze Session"}
+          {sessionBusy ? "Analyzing session…" : "Analyze Session"}
         </button>
         <button
           type="button"
-          className="secondary-btn"
-          onClick={runRecentHand}
-          disabled={!available || !recentHandIds.length || loading === "hand"}
+          className="secondary-btn coach-action-btn"
+          onClick={() => void runRecentHand()}
+          disabled={handDisabled}
+          title={handTitle}
+          aria-disabled={handDisabled}
         >
-          {loading === "hand" ? "Analyzing hand…" : "Analyze Latest Hand"}
+          {handBusy ? "Analyzing hand…" : "Analyze Latest Hand"}
         </button>
+        {sessionDisabled && sessionTitle ? (
+          <p className="muted small ai-action-hint">{sessionTitle}</p>
+        ) : null}
+        {handDisabled && handTitle && handTitle !== sessionTitle ? (
+          <p className="muted small ai-action-hint">{handTitle}</p>
+        ) : null}
       </div>
 
       {error ? <div className="error-banner">{error}</div> : null}

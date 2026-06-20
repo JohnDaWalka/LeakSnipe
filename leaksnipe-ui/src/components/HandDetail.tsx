@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import {
   api,
   formatAiProviderFromStatus,
-  isOllamaProviderRef,
   type AiAnalysis,
   type AiStatus,
   type HandDetail,
@@ -27,6 +26,8 @@ type HandDetailPanelProps = {
   sessionVpip?: number;
   sessionPfr?: number;
   loading?: boolean;
+  error?: string | null;
+  onRetry?: () => void;
 };
 
 function formatWon(amount: number, isTournament: boolean) {
@@ -42,6 +43,8 @@ export function HandDetailPanel({
   sessionVpip,
   sessionPfr,
   loading,
+  error,
+  onRetry,
 }: HandDetailPanelProps) {
   const [analyzing, setAnalyzing] = useState(false);
   const [analysis, setAnalysis] = useState<AiAnalysis | null>(null);
@@ -57,7 +60,7 @@ export function HandDetailPanel({
     }).catch(() => setAiStatus(null));
   }, []);
 
-  if (loading || !hand) {
+  if (!hand) {
     return (
       <div className="detail-panel detail-panel-loading">
         <div className="detail-skeleton" />
@@ -70,6 +73,8 @@ export function HandDetailPanel({
     setAnalyzing(true);
     setAiError(null);
     try {
+      const freshStatus = await api.aiStatus();
+      setAiStatus(freshStatus);
       const res = await api.analyzeHand(hand.hand_id);
       if (res.dataset_context_hands != null) setDatasetHands(res.dataset_context_hands);
       setWebContextUsed(Boolean(res.web_context_included ?? res.analysis.web_context_included));
@@ -86,7 +91,11 @@ export function HandDetailPanel({
   };
 
   const activeProviderLabel = formatAiProviderFromStatus(aiStatus);
-  const analyzingWithOllama = isOllamaProviderRef(aiStatus?.llm_provider);
+  const analyzingWithOllama =
+    aiStatus?.provider_chain?.[0] === "ollama" ||
+    (aiStatus?.ai_provider_pref === "ollama" &&
+      !aiStatus?.asi1_ready &&
+      Boolean(aiStatus?.ollama_ready));
   const datasetContextActive =
     Boolean(aiStatus?.ai_include_dataset_context ?? true) &&
     (datasetHands ?? aiStatus?.dataset_context_hands ?? 0) > 0;
@@ -94,12 +103,14 @@ export function HandDetailPanel({
   const webContextEnabled = webSearchMode !== "off";
 
   const heroCards = parseCardList(hand.hero_cards);
+  const boardCards = hand.board_cards ?? [];
+  const boardLoading = Boolean(loading && boardCards.length === 0 && !hand.streets?.length);
   const opponentNames = Object.values(hand.players ?? {})
     .filter((p) => !p.is_hero)
     .map((p) => p.name);
 
-  const board = (hand.board_cards ?? []).join(" ");
-  const flop = (hand.board_cards ?? []).slice(0, 3).join(" ");
+  const board = boardCards.join(" ");
+  const flop = boardCards.slice(0, 3).join(" ");
   const visualPresets: VisualPreset[] = [];
   if (flop) {
     visualPresets.push({
@@ -131,6 +142,17 @@ export function HandDetailPanel({
           ✕
         </button>
       </div>
+
+      {error ? (
+        <div className="error-banner" role="alert">
+          {error}
+          {onRetry ? (
+            <button type="button" className="ghost-btn small" onClick={onRetry} style={{ marginLeft: "0.5rem" }}>
+              Retry
+            </button>
+          ) : null}
+        </div>
+      ) : null}
 
       <button type="button" className="replay-hero-btn" onClick={onOpenReplayer}>
         <span className="replay-hero-icon" aria-hidden>▶</span>
@@ -187,25 +209,34 @@ export function HandDetailPanel({
         <div className="card-row">
           {heroCards.length > 0
             ? heroCards.map((c, i) => <PlayingCard key={i} card={c} />)
-            : <span className="muted">—</span>}
+            : loading
+              ? <span className="muted">Loading…</span>
+              : <span className="muted">—</span>}
         </div>
       </div>
 
-      {hand.board_cards?.length > 0 ? (
+      {boardCards.length > 0 ? (
         <div className="detail-cards-row">
           <span className="detail-label">Board</span>
           <div className="card-row">
-            {hand.board_cards.map((c, i) => (
+            {boardCards.map((c, i) => (
               <PlayingCard key={i} card={c} />
             ))}
           </div>
         </div>
+      ) : boardLoading ? (
+        <div className="detail-cards-row">
+          <span className="detail-label">Board</span>
+          <span className="muted">Loading board…</span>
+        </div>
       ) : null}
 
-      <OpponentHudPanel names={opponentNames} title="Opponents" />
+      {opponentNames.length > 0 ? (
+        <OpponentHudPanel names={opponentNames} title="Opponents" />
+      ) : null}
 
       <div className="detail-actions">
-        <button type="button" className="secondary-btn" onClick={runAi} disabled={analyzing}>
+        <button type="button" className="secondary-btn" onClick={runAi} disabled={analyzing || Boolean(error)}>
           {analyzing ? `Analyzing with ${activeProviderLabel}…` : "AI Coach"}
         </button>
         {datasetContextActive ? (
@@ -250,20 +281,26 @@ export function HandDetailPanel({
 
       <div className="streets-log">
         <div className="detail-label">Action Log</div>
-        {hand.streets?.map((street) => (
-          <div key={street.name} className="street-block">
-            <div className="street-name">
-              {street.name}
-              {street.cards?.length ? ` · ${street.cards.join(" ")}` : ""}
-            </div>
-            {street.actions?.map((act, i) => (
-              <div key={i} className="action-line mono">
-                {act.player}: {act.action}
-                {act.amount > 0 ? ` $${act.amount.toFixed(2)}` : ""}
+        {boardLoading ? (
+          <p className="muted">Loading actions…</p>
+        ) : hand.streets?.length ? (
+          hand.streets.map((street) => (
+            <div key={street.name} className="street-block">
+              <div className="street-name">
+                {street.name}
+                {street.cards?.length ? ` · ${street.cards.join(" ")}` : ""}
               </div>
-            ))}
-          </div>
-        ))}
+              {street.actions?.map((act, i) => (
+                <div key={i} className="action-line mono">
+                  {act.player}: {act.action}
+                  {act.amount > 0 ? ` $${act.amount.toFixed(2)}` : ""}
+                </div>
+              ))}
+            </div>
+          ))
+        ) : (
+          <p className="muted">No action log</p>
+        )}
       </div>
     </div>
   );

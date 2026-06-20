@@ -19,6 +19,7 @@ if (-not (Test-Path $Script)) {
 }
 
 $LogPath = Join-Path $env:TEMP "leaksnipe_python_hud.log"
+$ErrorLogPath = Join-Path $env:TEMP "leaksnipe_python_hud.err.log"
 $PythonCandidates = @()
 if ($env:LEAKSNIPE_PYTHON) { $PythonCandidates += $env:LEAKSNIPE_PYTHON }
 $PythonCandidates += @("python", "python3", "py")
@@ -28,14 +29,17 @@ foreach ($py in $PythonCandidates) {
     try {
         if ($py -eq "py") {
             $proc = Start-Process -FilePath $py -ArgumentList @("-3", $Script, "--live-hud") `
-                -WorkingDirectory $Root -PassThru -RedirectStandardOutput $LogPath -RedirectStandardError $LogPath
+                -WorkingDirectory $Root -PassThru -RedirectStandardOutput $LogPath -RedirectStandardError $ErrorLogPath
         } else {
             $proc = Start-Process -FilePath $py -ArgumentList @($Script, "--live-hud") `
-                -WorkingDirectory $Root -PassThru -RedirectStandardOutput $LogPath -RedirectStandardError $LogPath
+                -WorkingDirectory $Root -PassThru -RedirectStandardOutput $LogPath -RedirectStandardError $ErrorLogPath
         }
         Start-Sleep -Milliseconds 800
         if ($proc.HasExited -and $proc.ExitCode -ne 0) {
-            $tail = Get-Content $LogPath -Tail 20 -ErrorAction SilentlyContinue
+            $tail = @(
+                Get-Content $LogPath -Tail 10 -ErrorAction SilentlyContinue
+                Get-Content $ErrorLogPath -Tail 20 -ErrorAction SilentlyContinue
+            )
             $lastErr = "Exit $($proc.ExitCode). Log tail:`n$($tail -join "`n")"
             continue
         }
@@ -43,6 +47,7 @@ foreach ($py in $PythonCandidates) {
         $PidPath = Join-Path $env:TEMP "leaksnipe_python_hud.pid"
         Set-Content -Path $PidPath -Value $proc.Id -Encoding ascii
         Write-Host "Log: $LogPath"
+        Write-Host "Error log: $ErrorLogPath"
         exit 0
     } catch {
         $lastErr = $_.Exception.Message

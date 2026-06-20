@@ -3,80 +3,14 @@ import {
   api,
   waitForBackend,
   type CfrResult,
-  type ChartCell,
   type TheoryChartResult,
   type TheoryGame,
   type ValueNetResult,
 } from "../lib/api";
+import { RangeStudio } from "./RangeStudio";
 
 const DEPTHS = [5, 10, 25, 35, 50, 75, 100] as const;
 const POSITIONS = ["UTG", "MP", "CO", "BTN", "SB", "BB"] as const;
-const RANKS = "AKQJT98765432";
-
-const ACTION_COLORS: Record<string, string> = {
-  fold: "var(--chart-fold, #334155)",
-  push: "var(--chart-push, #ef4444)",
-  open: "var(--chart-open, #22c55e)",
-  call: "var(--chart-call, #3b82f6)",
-  defend: "var(--chart-defend, #14b8a6)",
-  "3bet": "var(--chart-3bet, #a855f7)",
-};
-
-function cellLabel(cell: ChartCell | null): string {
-  if (!cell) return "";
-  const pct = Math.round(cell.freq * 100);
-  if (pct >= 95) return cell.notation;
-  return `${cell.notation} ${pct}%`;
-}
-
-function RangeGrid({
-  grid,
-  selected,
-  onSelect,
-}: {
-  grid: (ChartCell | null)[][];
-  selected: string | null;
-  onSelect: (notation: string, cell: ChartCell) => void;
-}) {
-  return (
-    <div className="range-chart-wrap">
-      <table className="range-chart">
-        <thead>
-          <tr>
-            <th />
-            {RANKS.split("").map((r) => (
-              <th key={r}>{r}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {grid.map((row, ri) => (
-            <tr key={RANKS[ri]}>
-              <th>{RANKS[ri]}</th>
-              {row.map((cell, ci) => {
-                if (!cell) {
-                  return <td key={ci} className="range-cell empty" />;
-                }
-                const isSel = selected === cell.notation;
-                return (
-                  <td
-                    key={ci}
-                    className={`range-cell action-${cell.action}${isSel ? " selected" : ""}`}
-                    style={{ backgroundColor: ACTION_COLORS[cell.action] ?? ACTION_COLORS.fold }}
-                    title={`${cell.notation}: ${cell.action} ${(cell.freq * 100).toFixed(0)}%${cell.nn_value_pct != null ? ` · NN ${cell.nn_value_pct.toFixed(0)}%` : ""}`}
-                    onClick={() => onSelect(cell.notation, cell)}
-                  >
-                    <span className="range-cell-text">{cellLabel(cell)}</span>
-                  </td>
-                );
-              })}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
 
 export function TheoryPanel() {
   const [games, setGames] = useState<TheoryGame[]>([]);
@@ -88,8 +22,6 @@ export function TheoryPanel() {
 
   const [chart, setChart] = useState<TheoryChartResult | null>(null);
   const [chartLoading, setChartLoading] = useState(false);
-  const [selectedHand, setSelectedHand] = useState<string | null>(null);
-  const [selectedCell, setSelectedCell] = useState<ChartCell | null>(null);
 
   const [gameId, setGameId] = useState("tournament_push_fold");
   const [iterations, setIterations] = useState(10000);
@@ -117,7 +49,9 @@ export function TheoryPanel() {
         position,
         ante_per_player: antePerPlayer,
         num_players: numPlayers,
-        include_nn: true,
+        // Loading neural estimates for all 169 cells is prohibitively slow; the
+        // selected-hand value tool below remains available on demand.
+        include_nn: false,
       });
       setChart(res);
     } catch (err) {
@@ -207,9 +141,7 @@ export function TheoryPanel() {
     }
   };
 
-  const onCellSelect = (notation: string, cell: ChartCell) => {
-    setSelectedHand(notation);
-    setSelectedCell(cell);
+  const onHandSelect = (notation: string) => {
     if (notation.length === 2) {
       setHero(`${notation[0]}s${notation[1]}h`);
     } else if (notation.endsWith("s")) {
@@ -266,7 +198,10 @@ export function TheoryPanel() {
 
       <section className="panel-card theory-charts">
         <div className="theory-chart-header">
-          <h3>Stack-depth chart</h3>
+          <div>
+            <h3>Range Studio</h3>
+            <p className="muted small">Predefined CFR+ charts with manual range construction and custom themes.</p>
+          </div>
           <div className="depth-tabs">
             {depths.map((d) => (
               <button
@@ -280,56 +215,18 @@ export function TheoryPanel() {
             ))}
           </div>
         </div>
-        <label>
-          Position
-          <select value={position} onChange={(e) => setPosition(e.target.value)}>
-            {POSITIONS.map((p) => (
-              <option key={p} value={p}>
-                {p}
-              </option>
-            ))}
-          </select>
-        </label>
-        {chartLoading && <p className="muted">Loading chart…</p>}
-        {chart && !chartLoading && (
-          <>
-            <div className="chart-legend">
-              {chart.legend.map((a) => (
-                <span key={a} className="legend-item">
-                  <span className="legend-swatch" style={{ background: ACTION_COLORS[a] }} />
-                  {a}
-                </span>
-              ))}
-            </div>
-            <RangeGrid
-              grid={chart.grid}
-              selected={selectedHand}
-              onSelect={onCellSelect}
-            />
-            <div className="theory-results compact">
-              <div className="stat-row">
-                <span>Mode / source</span>
-                <strong>
-                  {chart.mode} · {chart.source}
-                </strong>
-              </div>
-              <div className="stat-row">
-                <span>CFR+ exploitability</span>
-                <strong>{chart.cfr.exploitability?.toFixed(4) ?? "—"}</strong>
-              </div>
-              {selectedCell && (
-                <div className="stat-row">
-                  <span>{selectedHand}</span>
-                  <strong>
-                    {selectedCell.action} {(selectedCell.freq * 100).toFixed(0)}%
-                    {selectedCell.nn_value_pct != null && ` · NN ${selectedCell.nn_value_pct.toFixed(0)}%`}
-                  </strong>
-                </div>
-              )}
-            </div>
-            <p className="muted small">{chart.note}</p>
-          </>
-        )}
+        <RangeStudio
+          chart={chart}
+          loading={chartLoading}
+          depths={depths}
+          stackBb={stackBb}
+          position={position}
+          positions={POSITIONS}
+          onStackChange={setStackBb}
+          onPositionChange={setPosition}
+          onHandSelect={onHandSelect}
+        />
+        {chart?.note ? <p className="muted small">{chart.note}</p> : null}
       </section>
 
       <div className="theory-grid">

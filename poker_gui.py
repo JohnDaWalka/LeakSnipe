@@ -98,8 +98,9 @@ except ImportError:
 from themes import THEMES, lighten as _lighten, darken as _darken, blend as _blend
 from models import Hand, HandDatabase
 from parsers import HandParser
-from analysis import LeakEngine, SummaryGenerator
+from analysis import LeakEngine, SummaryGenerator, hand_3bet_flags
 from importing import HandImporter, discover_scan_dirs, merge_scan_dirs
+from db_migrations import apply_migrations, read_player_position_stats, refresh_hand_position_facts
 from ocr_capture import OCRCaptureBridge, ReplayWindowCapture
 from utils import (
     font_style as _font_style,
@@ -373,6 +374,8 @@ class HandDatabase:
         with self.lock:
             conn = self._connect()
             try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=5000")
                 c = conn.cursor()
                 c.executescript("""
                     CREATE TABLE IF NOT EXISTS hands (
@@ -463,6 +466,7 @@ class HandDatabase:
                     CREATE INDEX IF NOT EXISTS idx_hand_tags_tag ON hand_tags(tag);
                     CREATE INDEX IF NOT EXISTS idx_hand_tags_hand_id ON hand_tags(hand_id);
                 """)
+                apply_migrations(conn)
                 conn.commit()
             finally:
                 conn.close()
@@ -537,6 +541,7 @@ class HandDatabase:
                         "INSERT INTO winners (hand_id, player_name, amount) VALUES (?,?,?)",
                         (hand.hand_id, w["name"], w["amount"]),
                     )
+                refresh_hand_position_facts(conn, hand.hand_id)
                 conn.commit()
             finally:
                 conn.close()
@@ -793,7 +798,7 @@ class HandDatabase:
                 conn.close()
 
 
-    def save_player_type(self, name, auto_type, hands, vpip, pfr, af, fold_cbet, wtsd, site=""):
+    def save_player_type(self, name, auto_type, hands, vpip, pfr, af, fold_cbet, wtsd, site="", three_bet=0.0):
         with self.lock:
             conn = self._connect()
             try:
@@ -802,9 +807,9 @@ class HandDatabase:
                 manual = existing[0] if existing else ""
                 conn.execute(
                     "INSERT OR REPLACE INTO player_types "
-                    "(name, site, auto_type, manual_type, hands, vpip, pfr, af, fold_cbet, wtsd, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (name, site, auto_type, manual, hands, vpip, pfr, af, fold_cbet, wtsd,
+                    "(name, site, auto_type, manual_type, hands, vpip, pfr, af, fold_cbet, wtsd, three_bet, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (name, site, auto_type, manual, hands, vpip, pfr, af, fold_cbet, wtsd, three_bet,
                      datetime.now().isoformat()))
                 conn.commit()
             finally:
@@ -830,14 +835,14 @@ class HandDatabase:
             conn = self._connect()
             try:
                 row = conn.execute(
-                    "SELECT auto_type, manual_type, hands, vpip, pfr, af, fold_cbet, wtsd "
+                    "SELECT auto_type, manual_type, hands, vpip, pfr, af, fold_cbet, wtsd, three_bet "
                     "FROM player_types WHERE name = ?", (name,)).fetchone()
                 if not row:
                     return None
                 return {
                     "auto_type": row[0], "manual_type": row[1], "hands": row[2],
                     "vpip": row[3], "pfr": row[4], "af": row[5],
-                    "fold_cbet": row[6], "wtsd": row[7],
+                    "fold_cbet": row[6], "wtsd": row[7], "three_bet": row[8] or 0.0,
                     "effective_type": row[1] if row[1] else row[0],
                 }
             finally:
@@ -855,7 +860,7 @@ class HandDatabase:
             conn = self._connect()
             try:
                 rows = conn.execute(
-                    f"SELECT name, auto_type, manual_type, hands, vpip, pfr, af, fold_cbet, wtsd "
+                    f"SELECT name, auto_type, manual_type, hands, vpip, pfr, af, fold_cbet, wtsd, three_bet "
                     f"FROM player_types WHERE name IN ({placeholders})",
                     unique,
                 ).fetchall()
@@ -864,7 +869,7 @@ class HandDatabase:
                     result[row[0]] = {
                         "auto_type": row[1], "manual_type": row[2], "hands": row[3],
                         "vpip": row[4], "pfr": row[5], "af": row[6],
-                        "fold_cbet": row[7], "wtsd": row[8],
+                        "fold_cbet": row[7], "wtsd": row[8], "three_bet": row[9] or 0.0,
                         "effective_type": row[2] if row[2] else row[1],
                     }
                 return result
@@ -884,60 +889,26 @@ class HandDatabase:
 
     def get_player_position_stats(self, name: str) -> dict:
         """Per-position VPIP/PFR for a player across up to 9-max tables."""
-        POSITIONS = ["UTG", "UTG+1", "UTG+2", "MP", "HJ", "CO", "BTN", "SB", "BB"]
-        result = {p: {"pfr": 0.0, "vpip": 0.0, "hands": 0} for p in POSITIONS}
         with self.lock:
             conn = self._connect()
             try:
-                rows = conn.execute("""
-                    SELECT p.hand_id, p.seat, h.button_seat
-                    FROM players p JOIN hands h ON p.hand_id = h.hand_id
-                    WHERE p.name = ? AND p.is_hero = 0
-                """, (name,)).fetchall()
-                for row in rows:
-                    hand_id, seat, button_seat = row[0], row[1], row[2]
-                    all_seats = [r[0] for r in conn.execute(
-                        "SELECT seat FROM players WHERE hand_id=? ORDER BY seat", (hand_id,)).fetchall()]
-                    if not all_seats or button_seat not in all_seats or seat not in all_seats:
-                        continue
-                    n = len(all_seats)
-                    dist = (all_seats.index(seat) - all_seats.index(button_seat)) % n
-                    if   dist == 0:                       pos = "BTN"
-                    elif dist == 1:                       pos = "SB"
-                    elif dist == 2:                       pos = "BB"
-                    elif dist == n - 1:                   pos = "CO"
-                    elif n >= 5 and dist == n - 2:        pos = "HJ"
-                    elif n >= 6 and dist == n - 3:        pos = "MP"
-                    elif n >= 7 and dist == n - 4:        pos = "UTG+2"
-                    elif n >= 8 and dist == n - 5:        pos = "UTG+1"
-                    else:                                 pos = "UTG"
-                    result[pos]["hands"] += 1
-                    if conn.execute("SELECT 1 FROM actions WHERE hand_id=? AND player=? AND street='preflop' AND action IN ('call','raise','bet') LIMIT 1", (hand_id, name)).fetchone():
-                        result[pos]["vpip"] += 1
-                    if conn.execute("SELECT 1 FROM actions WHERE hand_id=? AND player=? AND street='preflop' AND action IN ('raise','bet') LIMIT 1", (hand_id, name)).fetchone():
-                        result[pos]["pfr"] += 1
+                return read_player_position_stats(conn, name)
             finally:
                 conn.close()
-        for pos in POSITIONS:
-            h = result[pos]["hands"]
-            if h > 0:
-                result[pos]["vpip"] = round(result[pos]["vpip"] / h * 100, 1)
-                result[pos]["pfr"]  = round(result[pos]["pfr"]  / h * 100, 1)
-        return result
 
     def get_all_player_types(self):
         with self.lock:
             conn = self._connect()
             try:
                 rows = conn.execute(
-                    "SELECT name, auto_type, manual_type, hands, vpip, pfr, af, fold_cbet, wtsd "
+                    "SELECT name, auto_type, manual_type, hands, vpip, pfr, af, fold_cbet, wtsd, three_bet "
                     "FROM player_types ORDER BY hands DESC").fetchall()
                 results = []
                 for r in rows:
                     results.append({
                         "name": r[0], "auto_type": r[1], "manual_type": r[2],
                         "hands": r[3], "vpip": r[4], "pfr": r[5], "af": r[6],
-                        "fold_cbet": r[7], "wtsd": r[8],
+                        "fold_cbet": r[7], "wtsd": r[8], "three_bet": r[9] or 0.0,
                         "effective_type": r[2] if r[2] else r[1],
                     })
                 return results
@@ -2474,6 +2445,7 @@ class StationDetector:
             "total_hands": 0, "vpip_hands": 0, "pfr_hands": 0,
             "bets_raises": 0, "calls": 0, "folds_to_cbet": 0,
             "cbet_faced": 0, "saw_flop": 0, "went_to_sd": 0,
+            "three_bet_opportunities": 0, "three_bet_made": 0,
         })
 
         for h in hands:
@@ -2527,6 +2499,12 @@ class StationDetector:
                 if went_sd:
                     player_data[pname]["went_to_sd"] += 1
 
+                opp_3b, made_3b = hand_3bet_flags(h, pname)
+                if opp_3b:
+                    player_data[pname]["three_bet_opportunities"] += 1
+                    if made_3b:
+                        player_data[pname]["three_bet_made"] += 1
+
                 # Fold to C-Bet
                 if len(h.streets) > 1 and pfr_player and pfr_player != pname:
                     flop_st = h.streets[1] if h.streets[1]["name"] == "Flop" else None
@@ -2550,11 +2528,14 @@ class StationDetector:
             af = round(d["bets_raises"] / max(d["calls"], 1), 2)
             fold_cbet = round(100 * d["folds_to_cbet"] / max(d["cbet_faced"], 1), 1)
             wtsd = round(100 * d["went_to_sd"] / sf, 1)
+            three_bet = round(
+                100 * d["three_bet_made"] / max(d["three_bet_opportunities"], 1), 1
+            )
             classification = self._classify(vpip, pfr, af, d["total_hands"])
             results.append({
                 "name": pname, "hands": d["total_hands"],
                 "vpip": vpip, "pfr": pfr, "af": af,
-                "fold_cbet": fold_cbet, "wtsd": wtsd,
+                "fold_cbet": fold_cbet, "wtsd": wtsd, "three_bet": three_bet,
                 "auto_type": classification,
                 "manual_type": "",
                 "classification": classification,
@@ -3099,6 +3080,19 @@ def _is_acr_table_window(title: str, hwnd=None) -> bool:
     return has_game and has_table
 
 
+def _extract_tournament_id_from_title(title: str) -> str:
+    """Tournament id from ACR window title, e.g. '... Hold'em (35338352)'."""
+    if not title:
+        return ""
+    m = re.search(r"\((\d{5,})\)\s*$", title.strip())
+    if m:
+        return m.group(1)
+    m = re.search(r"Tournament\s+#(\d+)", title, re.I)
+    if m:
+        return m.group(1)
+    return ""
+
+
 def _extract_table_key_from_title(title: str) -> str:
     """Normalized table identifier from an ACR/WPN window title."""
     if not title:
@@ -3109,10 +3103,12 @@ def _extract_table_key_from_title(title: str) -> str:
     m = re.search(r"Table\s+(\d+)\b", title, re.I)
     if m:
         return m.group(1).strip().lower()
-    m = re.search(r"Tournament\s+#(\d+)", title, re.I)
-    if m:
-        return f"t{m.group(1)}"
     return ""
+
+
+def _table_window_identity(title: str) -> tuple:
+    """Stable (tournament_id, table_key) pair — ignores blind/level text changes."""
+    return (_extract_tournament_id_from_title(title), _extract_table_key_from_title(title))
 
 
 def _table_keys_match(window_key: str, hand_table_name: str) -> bool:
@@ -3125,14 +3121,19 @@ def _table_keys_match(window_key: str, hand_table_name: str) -> bool:
     wk = window_key.lower()
     if wk == ht:
         return True
+    if wk.isdigit() and ht.isdigit():
+        return wk == ht
     if wk.isdigit():
+        if ht == wk:
+            return True
+        if re.fullmatch(rf"table\s+{re.escape(wk)}(?:\s|$)", ht):
+            return True
         if re.search(rf"\btable\s+{re.escape(wk)}\b", ht):
             return True
-        if ht == wk or ht.endswith(wk):
-            return True
-    if wk.startswith("t") and wk[1:].isdigit():
-        return wk[1:] in ht
-    return wk in ht or ht in wk
+        return False
+    if ht.isdigit() and wk == ht:
+        return True
+    return wk == ht
 
 
 def _seat_map_signature(seat_map) -> tuple:
@@ -3231,6 +3232,7 @@ class MultiTableDetector:
         self._thread = None
         self._tables: dict = {}  # hwnd → (x, y, w, h)
         self._titles: dict = {}  # hwnd → window title
+        self._identities: dict = {}  # hwnd → (tournament_id, table_key)
 
     def find_all_windows(self):
         """Return {hwnd: (x, y, w, h, title, is_lobby)} for all matching visible windows."""
@@ -3268,6 +3270,7 @@ class MultiTableDetector:
         self._stop.clear()
         self._tables = {}
         self._titles = {}
+        self._identities = {}
         self._thread = threading.Thread(target=self._poll, daemon=True)
         self._thread.start()
 
@@ -3290,27 +3293,42 @@ class MultiTableDetector:
         prev_set = set(prev.keys())
         current_set = set(current.keys())
         for hwnd in prev_set - current_set:
-            logging.info(f"Table removed: hwnd={hwnd}")
+            _hud_log(logging.INFO, "Table removed: hwnd=%s", hwnd)
             self._titles.pop(hwnd, None)
+            self._identities.pop(hwnd, None)
             if self.on_table_removed:
                 self.on_table_removed(hwnd)
         for hwnd in current_set - prev_set:
             title = current_titles.get(hwnd, "")
-            logging.info(f"Table added: hwnd={hwnd} rect={current[hwnd]} title={title!r}")
+            ident = _table_window_identity(title)
+            _hud_log(logging.INFO, "Table added: hwnd=%s rect=%s title=%r ident=%s", hwnd, current[hwnd], title, ident)
+            self._identities[hwnd] = ident
             if self.on_table_added:
                 self.on_table_added(hwnd, current[hwnd], title)
         for hwnd in current_set & prev_set:
             old_title = self._titles.get(hwnd, "")
             new_title = current_titles.get(hwnd, "")
-            if new_title and new_title != old_title:
-                logging.info(f"Table switched: hwnd={hwnd} {old_title!r} -> {new_title!r}")
+            old_ident = self._identities.get(hwnd, ("", ""))
+            new_ident = _table_window_identity(new_title)
+            if new_ident != old_ident and new_ident[1]:
+                _hud_log(
+                    logging.INFO,
+                    "Table switched: hwnd=%s ident %s -> %s (%r -> %r)",
+                    hwnd, old_ident, new_ident, old_title, new_title,
+                )
+                self._identities[hwnd] = new_ident
                 if self.on_table_switched:
                     self.on_table_switched(hwnd, old_title, new_title, current[hwnd])
             elif current[hwnd] != prev[hwnd]:
                 if self.on_table_moved:
                     self.on_table_moved(hwnd, current[hwnd], new_title)
+            elif new_title and new_title != old_title:
+                self._titles[hwnd] = new_title
         self._tables = dict(current)
-        self._titles = dict(current_titles)
+        for hwnd in current_set:
+            self._titles[hwnd] = current_titles.get(hwnd, "")
+            if hwnd not in self._identities:
+                self._identities[hwnd] = _table_window_identity(current_titles.get(hwnd, ""))
 
 
 # ─── Live HUD — Current Hand Monitor ────────────────────────────────────────
@@ -3375,29 +3393,38 @@ class CurrentHandMonitor:
 class MultiHandMonitor:
     """Polls poker_hands.db per ACR table window and emits roster/hand updates."""
 
-    def __init__(self, db, settings, on_hand_update=None, poll_interval=2.0):
+    def __init__(self, db, settings, on_hand_update=None, poll_interval=1.0):
         self.db = db
         self.settings = settings
         self.on_hand_update = on_hand_update
         self.poll_interval = poll_interval
         self._stop = threading.Event()
         self._thread = None
-        self._windows: Dict[int, str] = {}  # hwnd → table_key from window title
+        self._windows: Dict[int, tuple] = {}  # hwnd → (tournament_id, table_key)
         self._last_sig: Dict[int, tuple] = {}  # hwnd → (hand_id, roster_signature)
+        self._force_refresh: set = set()
         self._check_lock = threading.Lock()
 
     def register_window(self, hwnd, title: str = ""):
-        key = _extract_table_key_from_title(title)
+        ident = _table_window_identity(title)
         with self._check_lock:
             prev = self._windows.get(hwnd)
-            self._windows[hwnd] = key
-            if prev != key:
+            self._windows[hwnd] = ident
+            if prev != ident:
                 self._last_sig.pop(hwnd, None)
+                self._force_refresh.add(hwnd)
 
     def unregister_window(self, hwnd):
         with self._check_lock:
             self._windows.pop(hwnd, None)
             self._last_sig.pop(hwnd, None)
+            self._force_refresh.discard(hwnd)
+
+    def invalidate_window(self, hwnd):
+        """Force the next poll to re-emit roster even if hand_id/sig unchanged."""
+        with self._check_lock:
+            self._last_sig.pop(hwnd, None)
+            self._force_refresh.add(hwnd)
 
     def check_now(self):
         """Immediate poll — call after HH import or table switch."""
@@ -3405,6 +3432,7 @@ class MultiHandMonitor:
             self._check()
         except Exception:
             logging.exception("Live hand monitor check_now failed")
+            _hud_log(logging.ERROR, "Live hand monitor check_now failed")
 
     def start(self):
         self._stop.clear()
@@ -3425,8 +3453,8 @@ class MultiHandMonitor:
     def _load_recent_hands(self, conn):
         conn.row_factory = sqlite3.Row
         return conn.execute(
-            "SELECT hand_id, max_seats, site, table_name FROM hands "
-            "ORDER BY imported_at DESC LIMIT 80"
+            "SELECT hand_id, max_seats, site, table_name, tournament_id FROM hands "
+            "ORDER BY imported_at DESC LIMIT 120"
         ).fetchall()
 
     def _load_seat_map(self, conn, hand_id):
@@ -3438,16 +3466,28 @@ class MultiHandMonitor:
             for p in players
         }
 
-    def _pick_hand_for_table(self, rows, table_key: str):
-        if table_key:
+    def _pick_hand_for_table(self, rows, tournament_id: str, table_key: str):
+        if table_key or tournament_id:
             for row in rows:
-                if _table_keys_match(table_key, row["table_name"] or ""):
-                    return row
+                row_tid = str(row["tournament_id"] or "")
+                if tournament_id and row_tid and row_tid != str(tournament_id):
+                    continue
+                if table_key and not _table_keys_match(table_key, row["table_name"] or ""):
+                    continue
+                return row
         return None
+
+    def _fallback_row(self, rows, tournament_id: str):
+        if tournament_id:
+            for row in rows:
+                if str(row["tournament_id"] or "") == str(tournament_id):
+                    return row
+        return rows[0] if rows else None
 
     def _check(self):
         with self._check_lock:
             windows = dict(self._windows)
+            force = set(self._force_refresh)
         if not windows:
             return
 
@@ -3457,20 +3497,34 @@ class MultiHandMonitor:
                 rows = self._load_recent_hands(conn)
                 if not rows:
                     return
-                fallback_row = rows[0]
                 updates = []
-                for hwnd, table_key in windows.items():
-                    row = self._pick_hand_for_table(rows, table_key)
+                for hwnd, (tournament_id, table_key) in windows.items():
+                    row = self._pick_hand_for_table(rows, tournament_id, table_key)
                     if row is None and len(windows) == 1:
-                        row = fallback_row
+                        row = self._fallback_row(rows, tournament_id)
                     if row is None:
+                        _hud_log(
+                            logging.DEBUG,
+                            "No hand match hwnd=%s tournament=%r table=%r",
+                            hwnd, tournament_id, table_key,
+                        )
                         continue
                     hand_id = row["hand_id"]
                     seat_map = self._load_seat_map(conn, hand_id)
                     sig = (hand_id, _seat_map_signature(seat_map))
-                    if self._last_sig.get(hwnd) == sig:
+                    if self._last_sig.get(hwnd) == sig and hwnd not in force:
                         continue
                     self._last_sig[hwnd] = sig
+                    if hwnd in force:
+                        with self._check_lock:
+                            self._force_refresh.discard(hwnd)
+                    roster_names = [info.get("name") for info in seat_map.values()]
+                    _hud_log(
+                        logging.INFO,
+                        "Roster update hwnd=%s hand=%s table=%r seats=%d players=%s",
+                        hwnd, hand_id, row["table_name"], len(seat_map),
+                        ", ".join(n for n in roster_names if n)[:120],
+                    )
                     updates.append((
                         hwnd,
                         hand_id,
@@ -3487,18 +3541,85 @@ class MultiHandMonitor:
                 self.on_hand_update(*payload)
 
 
+# ─── Live HUD — Stat helpers ─────────────────────────────────────────────────
+def _hud_stat_fingerprint(stat):
+    if not stat:
+        return ()
+    return (
+        stat.get("hands"),
+        stat.get("vpip"),
+        stat.get("pfr"),
+        stat.get("af"),
+        stat.get("wtsd"),
+        stat.get("fold_cbet"),
+        stat.get("three_bet"),
+        stat.get("effective_type"),
+    )
+
+
+def _hud_format_stat_value(theme, stat_name, raw, suffix=""):
+    """Format a HUD stat cell; 0% is valid and must not render as a dash."""
+    t = theme
+    if stat_name == "hands":
+        if not raw:
+            return "–", t.get("text_dim", "#888")
+        return str(int(raw)), t.get("gold", "#FFD700")
+    if not isinstance(raw, (int, float)):
+        return "–", t.get("text_dim", "#888")
+    if stat_name == "af":
+        return f"{raw:.1f}", _hud_stat_color(t, stat_name, raw)
+    return f"{raw:.0f}{suffix}", _hud_stat_color(t, stat_name, raw)
+
+
+def _hud_seat_position(seat, button_seat, seat_map):
+    """Map a live table seat to a 9-max position label."""
+    if seat is None or button_seat is None:
+        return None
+    seats = sorted(seat_map.keys())
+    if seat not in seats or button_seat not in seats:
+        return None
+    n = len(seats)
+    dist = (seats.index(seat) - seats.index(button_seat)) % n
+    if dist == 0:
+        return "BTN"
+    if dist == 1:
+        return "SB"
+    if dist == 2:
+        return "BB"
+    if dist == n - 1:
+        return "CO"
+    if n >= 5 and dist == n - 2:
+        return "HJ"
+    if n >= 6 and dist == n - 3:
+        return "MP"
+    if n >= 7 and dist == n - 4:
+        return "UTG+2"
+    if n >= 8 and dist == n - 5:
+        return "UTG+1"
+    return "UTG"
+
+
+def _hud_pos_stat_fingerprint(pos_stats, table_position):
+    if not table_position or not pos_stats:
+        return ()
+    ps = pos_stats.get(table_position) or {}
+    return (table_position, ps.get("hands"), ps.get("vpip"), ps.get("pfr"))
+
+
 # ─── Live HUD — Stat Tooltip ─────────────────────────────────────────────────
 class HUDStatTooltip(tk.Toplevel):
     """DriveHUD2-style hover popup: overall stats + per-position VPIP/PFR (9-max)."""
 
-    W, H = 260, 285
+    W, H = 260, 300
 
-    def __init__(self, parent_widget, theme, player_name: str, stat: dict, db):
+    def __init__(self, parent_widget, theme, player_name: str, stat: dict, db,
+                 table_position=None):
         super().__init__(parent_widget.winfo_toplevel())
         self.overrideredirect(True)
         self.attributes("-topmost", True)
         self.configure(bg=theme["bg_base"])
         t = theme
+        self._table_position = table_position
         try:
             bx = parent_widget.winfo_rootx()
             by = parent_widget.winfo_rooty()
@@ -3513,11 +3634,19 @@ class HUDStatTooltip(tk.Toplevel):
                                  bg=t["bg_base"], highlightthickness=0)
         self._canvas.pack()
         self._draw_loading(t, player_name)
-        import threading
         def _fetch():
-            pos_stats = db.get_player_position_stats(player_name)
+            full_stat = stat
+            if not full_stat or not full_stat.get("hands"):
+                try:
+                    full_stat = db.get_player_type(player_name) or {}
+                except Exception:
+                    full_stat = stat or {}
             try:
-                self.after(0, lambda: self._draw_full(t, player_name, stat, pos_stats))
+                pos_stats = db.get_player_position_stats(player_name)
+            except Exception:
+                pos_stats = {}
+            try:
+                self.after(0, lambda: self._draw_full(t, player_name, full_stat, pos_stats))
             except Exception:
                 pass
         threading.Thread(target=_fetch, daemon=True).start()
@@ -3541,12 +3670,11 @@ class HUDStatTooltip(tk.Toplevel):
         self._rr(4, 4, self.W-4, self.H-4, 12, fill=_lighten(t["bg_card"], 0.04), outline=t["border"], width=1)
         self._rr(4, 4, self.W-4, 36, 12, fill=_darken(t["bg_card"], 0.06), outline="")
         c.create_text(14, 20, text=player_name[:22], anchor="w", fill=t["text"], font=("Consolas", 11, "bold"))
-        # Overall row
         overall = [
-            ("VPIP", f"{stat['vpip']:.0f}%" if stat and stat.get("vpip") else "–"),
-            ("PFR",  f"{stat['pfr']:.0f}%"  if stat and stat.get("pfr")  else "–"),
-            ("AF",   f"{stat['af']:.1f}"     if stat and stat.get("af")   else "–"),
-            ("WSD",  f"{stat['wtsd']:.0f}%"  if stat and stat.get("wtsd") else "–"),
+            ("VPIP", f"{stat['vpip']:.0f}%" if stat and isinstance(stat.get("vpip"), (int, float)) else "–"),
+            ("PFR",  f"{stat['pfr']:.0f}%"  if stat and isinstance(stat.get("pfr"), (int, float)) else "–"),
+            ("3B",   f"{stat['three_bet']:.0f}%" if stat and isinstance(stat.get("three_bet"), (int, float)) else "–"),
+            ("AF",   f"{stat['af']:.1f}"     if stat and isinstance(stat.get("af"), (int, float)) else "–"),
         ]
         cw = (self.W - 20) // 4
         for i, (lbl, val) in enumerate(overall):
@@ -3560,15 +3688,17 @@ class HUDStatTooltip(tk.Toplevel):
         c.create_text(90,  90, text="VPIP",  anchor="w", fill=t["text_dim"], font=("Consolas", 8, "bold"))
         c.create_text(150, 90, text="PFR",   anchor="w", fill=t["text_dim"], font=("Consolas", 8, "bold"))
         c.create_text(210, 90, text="Hands", anchor="w", fill=t["text_dim"], font=("Consolas", 8, "bold"))
+        highlight_pos = self._table_position
         # 9 position rows
         for i, pos in enumerate(["UTG", "UTG+1", "UTG+2", "MP", "HJ", "CO", "BTN", "SB", "BB"]):
-            ry = 106 + i * 18
+            ry = 106 + i * 19
             ps = pos_stats.get(pos, {})
             n  = ps.get("hands", 0)
-            if pos == "BTN":
-                c.create_rectangle(12, ry-7, self.W-12, ry+9, fill=_lighten(t["bg_panel"], 0.06), outline="")
+            if pos == highlight_pos:
+                c.create_rectangle(12, ry-8, self.W-12, ry+10, fill=_lighten(t["bg_panel"], 0.10), outline="")
+            pos_color = t["gold"] if pos in (highlight_pos, "BTN") else t["text"]
             c.create_text(14,  ry, text=pos,
-                          anchor="w", fill=t["gold"] if pos == "BTN" else t["text"], font=("Consolas", 9, "bold"))
+                          anchor="w", fill=pos_color, font=("Consolas", 9, "bold"))
             c.create_text(90,  ry, text=f"{ps['vpip']:.0f}%" if n else "–", anchor="w", fill=t["text"],     font=("Consolas", 9))
             c.create_text(150, ry, text=f"{ps['pfr']:.0f}%"  if n else "–", anchor="w",
                           fill=t["green"] if n else t["text_dim"], font=("Consolas", 9))
@@ -3587,6 +3717,10 @@ def _hud_stat_color(t, stat_name, value):
     if stat_name == "pfr":
         if 10 <= value <= 22: return t.get("green",  "#4CAF50")
         if  8 <= value < 10 or 22 < value <= 30: return t.get("yellow", "#FFC107")
+        return t.get("red", "#F44336")
+    if stat_name == "three_bet":
+        if 4 <= value <= 12: return t.get("green",  "#4CAF50")
+        if 2 <= value < 4 or 12 < value <= 18: return t.get("yellow", "#FFC107")
         return t.get("red", "#F44336")
     if stat_name == "af":
         if 1.5 <= value <= 4.0: return t.get("green",  "#4CAF50")
@@ -3614,8 +3748,8 @@ class SeatBadge(tk.Canvas):
     _ROW1 = [
         ("VPIP",  "vpip",      "%"),
         ("PFR",   "pfr",       "%"),
+        ("3B",    "three_bet", "%"),
         ("AF",    "af",        ""),
-        ("H",     "hands",     ""),
     ]
     # Secondary stats: shown when rows==2
     _ROW2 = [
@@ -3626,12 +3760,21 @@ class SeatBadge(tk.Canvas):
     ]
 
     def __init__(self, parent, theme, player_info, stat, density="standard", db=None, loading=False,
-                 badge_scale=1.0, **kwargs):
+                 badge_scale=1.0, table_position=None, pos_stats=None, **kwargs):
         t = theme
         self._theme = t
         self._stat  = stat
         self._db    = db
         self._loading = loading
+        self._table_position = table_position
+        self._pos_stats = pos_stats or {}
+
+        display_stat = dict(stat) if stat else {}
+        pos_label = table_position
+        if pos_label and self._pos_stats:
+            ps = self._pos_stats.get(pos_label) or {}
+            if ps.get("hands", 0) > 0:
+                display_stat = {**display_stat, "vpip": ps.get("vpip", 0), "pfr": ps.get("pfr", 0)}
 
         p = scaled_hud_density_preset(density, badge_scale)
         LABEL_H = max(16, int(round(20 * badge_scale)))
@@ -3649,6 +3792,8 @@ class SeatBadge(tk.Canvas):
             classification = "..."
         else:
             classification = (stat.get("effective_type") or "Unknown") if stat else "Unknown"
+        if pos_label and not loading:
+            classification = f"{classification[:10]} · {pos_label}"
 
         # ── Floating name label (no background — transparent to table) ────────
         self.create_text(W // 2, LABEL_H // 2, text=name[:22], anchor="center",
@@ -3707,17 +3852,8 @@ class SeatBadge(tk.Canvas):
                 val_str = "..."
                 val_col = t.get("text_dim", "#888")
             else:
-                # raw value
-                raw = stat.get(key, 0) if stat else 0
-                if key == "hands":
-                    val_str = str(int(raw)) if raw else "–"
-                    val_col = t.get("gold", "#FFD700")
-                elif key == "af":
-                    val_str = f"{raw:.1f}" if raw else "–"
-                    val_col = _hud_stat_color(t, key, raw)
-                else:
-                    val_str = (f"{raw:.0f}{suffix}" if raw else "–")
-                    val_col = _hud_stat_color(t, key, raw)
+                raw = display_stat.get(key, 0)
+                val_str, val_col = _hud_format_stat_value(t, key, raw, suffix)
 
             # column divider (skip leftmost)
             if col_idx > 0:
@@ -3770,7 +3906,8 @@ class SeatBadge(tk.Canvas):
             return
         try:
             self._tooltip = HUDStatTooltip(self, self._theme, self._player_name,
-                                            self._stat, self._db)
+                                            self._stat, self._db,
+                                            table_position=self._table_position)
         except Exception:
             self._tooltip = None
 
@@ -4023,14 +4160,20 @@ class PlayerStatsCache:
                     self._entries.pop(name, None)
 
 
-def _show_hud_error(title, message):
-    """Surface HUD startup failures to the user (console + messagebox + log)."""
-    logging.error("%s: %s", title, message)
+def _hud_log(level, msg, *args):
+    """Write HUD diagnostics to poker_debug.log and leaksnipe_python_hud.log."""
+    logging.log(level, msg, *args)
     try:
+        text = msg % args if args else msg
         with open(HUD_LOG_PATH, "a", encoding="utf-8") as fh:
-            fh.write(f"{datetime.now().isoformat()} ERROR {title}: {message}\n")
+            fh.write(f"{datetime.now().isoformat()} {logging.getLevelName(level)} {text}\n")
     except OSError:
         pass
+
+
+def _show_hud_error(title, message):
+    """Surface HUD startup failures to the user (console + messagebox + log)."""
+    _hud_log(logging.ERROR, "%s: %s", title, message)
     try:
         from tkinter import messagebox
         messagebox.showerror(title, f"{message}\n\nLog: {HUD_LOG_PATH}")
@@ -4069,6 +4212,7 @@ class LiveHUDOverlay:
         self._last_max_seats = 6
         self._last_hand_id = None
         self._bound_table_key = ""
+        self._bound_table_identity = ("", "")
         self._window_title = ""
         self._layout_toggle = None
         self._reset_btn = None
@@ -4077,6 +4221,7 @@ class LiveHUDOverlay:
         self._hotkey_id = 1  # arbitrary ID for RegisterHotKey
         self._resize_job = None          # debounce handle for _on_win_configure
         self._stats_cache = PlayerStatsCache(db, ttl=45.0)
+        self._pos_stats_cache = {}
         self._stats_load_generation = 0
         self._last_hand_signature = None
         self._start_hotkey_listener()
@@ -4103,21 +4248,31 @@ class LiveHUDOverlay:
         """Track ACR window title; reset roster state when table identity changes."""
         title = window_title or self._window_title
         self._window_title = title
-        table_key = _extract_table_key_from_title(title)
-        if table_key and table_key != self._bound_table_key:
-            logging.info(f"HUD table bind: {self._bound_table_key!r} -> {table_key!r}")
+        ident = _table_window_identity(title)
+        table_key = ident[1]
+        if table_key and ident != self._bound_table_identity:
+            _hud_log(
+                logging.INFO,
+                "HUD table bind: %s -> %s (title=%r)",
+                self._bound_table_identity, ident, title[:80],
+            )
             self.reset_for_table_switch(table_key)
+            self._bound_table_identity = ident
         elif not table_key:
             self._bound_table_key = ""
+            self._bound_table_identity = ("", "")
 
     def reset_for_table_switch(self, table_key: str = ""):
         """Clear badges and cached roster when moving to a new tournament table."""
         self._bound_table_key = table_key or _extract_table_key_from_title(self._window_title)
+        if self._window_title:
+            self._bound_table_identity = _table_window_identity(self._window_title)
         self._last_hand_id = None
         self._last_hand_signature = None
         self._last_seat_map = {}
         self._last_seat_to_slot = {}
         self._clear_badges()
+        _hud_log(logging.INFO, "HUD reset for table switch key=%r", self._bound_table_key)
         if self._summary_panel is not None and self._summary_panel.winfo_exists():
             self._summary_panel.render(
                 layout_key=6,
@@ -4159,6 +4314,53 @@ class LiveHUDOverlay:
 
     def invalidate_stats_cache(self, names=None):
         self._stats_cache.invalidate(names)
+        if names is None:
+            self._pos_stats_cache.clear()
+        else:
+            for name in names:
+                self._pos_stats_cache.pop(name, None)
+
+    def _hand_button_seat(self, hand_id):
+        if not hand_id:
+            return None
+        with self.db.lock:
+            conn = self.db._connect()
+            try:
+                row = conn.execute(
+                    "SELECT button_seat FROM hands WHERE hand_id = ?", (hand_id,),
+                ).fetchone()
+                return row[0] if row else None
+            finally:
+                conn.close()
+
+    def _seat_positions_for_hand(self, seat_map, hand_id):
+        button_seat = self._hand_button_seat(hand_id)
+        if button_seat is None:
+            return {}
+        positions = {}
+        for seat, info in seat_map.items():
+            if info.get("is_hero"):
+                continue
+            pos = _hud_seat_position(seat, button_seat, seat_map)
+            if pos:
+                positions[seat] = pos
+        return positions
+
+    def _badge_should_rebuild(self, badge, pname, stat, loading, table_position, pos_stats):
+        if getattr(badge, "_player_name", None) != pname:
+            return True
+        badge_loading = getattr(badge, "_loading", False)
+        if badge_loading != (loading and stat is None):
+            return True
+        if _hud_stat_fingerprint(getattr(badge, "_stat", None)) != _hud_stat_fingerprint(stat):
+            return True
+        if getattr(badge, "_table_position", None) != table_position:
+            return True
+        if _hud_pos_stat_fingerprint(getattr(badge, "_pos_stats", None), table_position) != (
+            _hud_pos_stat_fingerprint(pos_stats, table_position)
+        ):
+            return True
+        return False
 
     def _edge_margin_pct(self):
         return hud_edge_margin_pct(self.settings)
@@ -4389,8 +4591,10 @@ class LiveHUDOverlay:
     def update_hand(self, seat_map, max_seats, site="Unknown", hand_id=None):
         """Refresh seat badges for a new/changed roster. Must be called from main thread."""
         if self._win is None or not self._win.winfo_exists():
+            _hud_log(logging.DEBUG, "update_hand skipped — overlay window missing")
             return
         if self._current_rect is None:
+            _hud_log(logging.DEBUG, "update_hand skipped — no table rect")
             return
 
         seat_map = tag_hero_seats(seat_map, self.settings, site)
@@ -4436,12 +4640,27 @@ class LiveHUDOverlay:
         self._refresh_selection_highlights()
         self._render_seat_guides(layout, seat_map, seat_to_slot, badge_offsets)
 
+        seat_positions = self._seat_positions_for_hand(seat_map, hand_id)
         cached_stats = self._stats_cache.get_batch(villain_names) if villain_names else {}
-        needs_async = any(name not in cached_stats for name in villain_names)
+        pos_stats_by_name = {
+            name: self._pos_stats_cache.get(name, {}) for name in villain_names
+        }
+        missing_stats = [name for name in villain_names if name not in cached_stats]
+        missing_pos = [name for name in villain_names if name not in self._pos_stats_cache]
+        needs_async = bool(missing_stats or missing_pos)
+        loading = bool(missing_stats)
 
         self._sync_seat_badges(
             seat_map, layout, seat_to_slot, density, badge_dx, badge_dy,
-            badge_offsets, w, h, cached_stats, loading=needs_async,
+            badge_offsets, w, h, cached_stats, loading=loading,
+            seat_positions=seat_positions, pos_stats_by_name=pos_stats_by_name,
+        )
+        _hud_log(
+            logging.INFO,
+            "HUD badges synced hand=%s villains=%d badge_seats=%s",
+            hand_id or self._last_hand_id,
+            villain_count,
+            sorted(self._badges.keys()),
         )
 
         if not needs_async:
@@ -4453,19 +4672,29 @@ class LiveHUDOverlay:
         def _load_stats(gen=generation, sm=seat_map, ms=max_seats, st=site,
                         hid=hand_id, names=list(villain_names), lay=layout, sts=seat_to_slot,
                         den=density, bdx=badge_dx, bdy=badge_dy, boff=badge_offsets,
-                        width=w, height=h):
-            try:
-                stats = self._stats_cache.get_batch(names)
-            except Exception:
-                logging.exception("HUD stats batch load failed")
-                stats = {}
+                        width=w, height=h, seat_pos=seat_positions,
+                        need_stats=list(missing_stats), need_pos=list(missing_pos)):
+            stats = dict(cached_stats)
+            if need_stats:
+                try:
+                    stats.update(self._stats_cache.get_batch(need_stats))
+                except Exception:
+                    logging.exception("HUD stats batch load failed")
+            pos_batch = dict(pos_stats_by_name)
+            for name in need_pos:
+                try:
+                    pos_batch[name] = self.db.get_player_position_stats(name)
+                    self._pos_stats_cache[name] = pos_batch[name]
+                except Exception:
+                    pos_batch[name] = {}
             if gen != self._stats_load_generation:
                 return
             try:
                 self.root.after(
                     0,
                     lambda: self._apply_loaded_stats(
-                        gen, sm, ms, st, hid, lay, sts, den, bdx, bdy, boff, width, height, stats,
+                        gen, sm, ms, st, hid, lay, sts, den, bdx, bdy, boff, width, height,
+                        stats, pos_batch, seat_pos,
                     ),
                 )
             except Exception:
@@ -4490,8 +4719,11 @@ class LiveHUDOverlay:
     def _sync_seat_badges(
         self, seat_map, layout, seat_to_slot, density, badge_dx, badge_dy,
         badge_offsets, w, h, stats_by_name, loading=False,
+        seat_positions=None, pos_stats_by_name=None,
     ):
         """Add/update/remove badges to match the current seat roster."""
+        seat_positions = seat_positions or {}
+        pos_stats_by_name = pos_stats_by_name or {}
         desired = self._desired_villain_seats(seat_map)
         for seat in list(self._badges.keys()):
             badge = self._badges.get(seat)
@@ -4499,10 +4731,20 @@ class LiveHUDOverlay:
             if expected_name is None:
                 self._remove_badge(seat)
                 continue
-            if badge is not None and getattr(badge, "_player_name", None) != expected_name:
+            stat = stats_by_name.get(expected_name)
+            table_position = seat_positions.get(seat)
+            pos_stats = pos_stats_by_name.get(expected_name)
+            if badge is not None and self._badge_should_rebuild(
+                badge, expected_name, stat, loading, table_position, pos_stats,
+            ):
                 self._remove_badge(seat)
 
         for seat, pname in desired.items():
+            stat = stats_by_name.get(pname)
+            table_position = seat_positions.get(seat)
+            pos_stats = pos_stats_by_name.get(pname)
+            badge_loading = loading and stat is None
+
             if seat in self._badges and self._badges[seat].winfo_exists():
                 badge = self._badges[seat]
                 pos = layout.get(seat_to_slot.get(seat))
@@ -4519,13 +4761,13 @@ class LiveHUDOverlay:
             pos = layout.get(seat_to_slot.get(seat))
             if pos is None:
                 continue
-            stat = stats_by_name.get(pname)
-            badge_loading = loading and stat is None
             host = self._create_badge_host(seat)
             badge = SeatBadge(
                 host, self.theme, info, stat,
                 density=density, db=self.db, loading=badge_loading,
                 badge_scale=self._badge_scale(),
+                table_position=table_position,
+                pos_stats=pos_stats,
             )
             seat_offset = self._slot_offset(badge_offsets, seat_to_slot, seat)
             px, py = self._resolve_badge_xy(
@@ -4573,6 +4815,7 @@ class LiveHUDOverlay:
     def _apply_loaded_stats(
         self, generation, seat_map, max_seats, site, hand_id, layout, seat_to_slot,
         density, badge_dx, badge_dy, badge_offsets, w, h, stats_by_name,
+        pos_stats_by_name=None, seat_positions=None,
     ):
         if generation != self._stats_load_generation:
             return
@@ -4581,6 +4824,8 @@ class LiveHUDOverlay:
         self._sync_seat_badges(
             seat_map, layout, seat_to_slot, density, badge_dx, badge_dy,
             badge_offsets, w, h, stats_by_name, loading=False,
+            seat_positions=seat_positions or self._seat_positions_for_hand(seat_map, hand_id),
+            pos_stats_by_name=pos_stats_by_name or {},
         )
 
     def refresh_stats_only(self):
@@ -7977,11 +8222,12 @@ class PokerApp(ctk.CTk):
             self.importer.start_watcher(callback=self._hud_watcher_callback)
 
     def _hud_watcher_callback(self, new_count, file_count):
+        monitor = getattr(self, "hand_monitor", None)
         if new_count:
             self.after(0, self._schedule_hud_cache_refresh)
-            monitor = getattr(self, "hand_monitor", None)
-            if monitor is not None:
-                self.after(400, monitor.check_now)
+        if monitor is not None:
+            # Re-check roster even when sidecar already imported the same hands.
+            self.after(200, monitor.check_now)
 
     def _schedule_hud_cache_refresh(self):
         if getattr(self, "_hud_cache_refresh_job", None) is not None:
@@ -7994,6 +8240,9 @@ class PokerApp(ctk.CTk):
     def _refresh_hud_player_cache(self):
         self._hud_cache_refresh_job = None
         threading.Thread(target=self._compute_players_bg, daemon=True).start()
+
+    def _on_player_stats_computed(self):
+        """Refresh HUD overlays after player_types cache is rebuilt."""
         for overlay in list(getattr(self, "_hud_overlays", {}).values()):
             try:
                 overlay.invalidate_stats_cache()
@@ -9890,9 +10139,14 @@ class PokerApp(ctk.CTk):
                 self.db.save_player_type(
                     name=p["name"], auto_type=p.get("auto_type", p["classification"]),
                     hands=p["hands"], vpip=p["vpip"], pfr=p["pfr"],
-                    af=p["af"], fold_cbet=p["fold_cbet"], wtsd=p["wtsd"])
+                    af=p["af"], fold_cbet=p["fold_cbet"], wtsd=p["wtsd"],
+                    three_bet=p.get("three_bet", 0.0))
             except Exception:
                 pass
+        try:
+            self.after(0, self._on_player_stats_computed)
+        except Exception:
+            pass
 
     # ── Settings ──────────────────────────────────────────────────────────
     def _refresh_dir_list(self):
@@ -10204,11 +10458,11 @@ class PokerApp(ctk.CTk):
             def _do():
                 overlay = self._hud_overlays.get(hwnd)
                 if overlay:
-                    overlay.reset_for_table_switch()
                     overlay.bind_table(new_title)
                     overlay.update_rect(rect)
                 if self.hand_monitor:
                     self.hand_monitor.register_window(hwnd, new_title)
+                    self.hand_monitor.invalidate_window(hwnd)
                     self.hand_monitor.check_now()
                 self._set_status(f"Table switch — HUD re-anchored ({new_title[:48]})")
             self.after(0, _do)
@@ -10230,7 +10484,7 @@ class PokerApp(ctk.CTk):
             db=self.db,
             settings=self.settings,
             on_hand_update=_on_hand_update,
-            poll_interval=2.0,
+            poll_interval=1.0,
         )
         self.table_detector.start()
         self.hand_monitor.start()

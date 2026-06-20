@@ -35,6 +35,11 @@ struct SidecarStatus {
     port: u16,
     log_path: String,
     last_error: String,
+    ownership: String,
+    pid: Option<u32>,
+    restart_failures: u32,
+    app_version: String,
+    repo_root: String,
 }
 
 fn api_port() -> u16 {
@@ -246,19 +251,58 @@ fn wait_for_healthy_sidecar(port: u16, attempts: u32, delay: Duration) -> bool {
     false
 }
 
-fn free_api_port(port: u16) {
+fn leaknipe_sidecar_on_port(port: u16) -> bool {
+    #[cfg(windows)]
+    {
+        let script = format!(
+            "$c = Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue | \
+             Select-Object -First 1 -ExpandProperty OwningProcess; \
+             if (-not $c) {{ exit 1 }}; \
+             $p = Get-CimInstance Win32_Process -Filter \"ProcessId=$c\" -ErrorAction SilentlyContinue; \
+             if ($p.CommandLine -match 'sidecar\\\\server\\.py') {{ exit 0 }} else {{ exit 1 }}"
+        );
+        return Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = port;
+        false
+    }
+}
+
+fn stop_listeners_on_port(port: u16, leaknipe_only: bool) {
     if sidecar_healthy(port) {
         return;
     }
     #[cfg(windows)]
     {
-        let script = format!(
-            "Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue | \
-             Select-Object -ExpandProperty OwningProcess -Unique | \
-             ForEach-Object {{ Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }}"
-        );
+        let filter = if leaknipe_only {
+            format!(
+                "$conns = Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue; \
+                 foreach ($c in $conns) {{ \
+                   $procId = $c.OwningProcess; \
+                   if (-not $procId -or $procId -le 0) {{ continue }}; \
+                   $proc = Get-CimInstance Win32_Process -Filter \"ProcessId=$procId\" -ErrorAction SilentlyContinue; \
+                   if ($proc.CommandLine -match 'sidecar\\\\server\\.py') {{ \
+                     Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue \
+                   }} \
+                 }}"
+            )
+        } else {
+            format!(
+                "Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue | \
+                 Select-Object -ExpandProperty OwningProcess -Unique | \
+                 ForEach-Object {{ Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }}"
+            )
+        };
         let _ = Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .args(["-NoProfile", "-NonInteractive", "-Command", &filter])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -325,15 +369,25 @@ fn spawn_backend(force: bool) -> Result<SpawnOutcome, String> {
 
     if port_in_use(port) {
         eprintln!("[leaksnipe-ui] Port {port} in use but health check slow - waiting for sidecar...");
-        if wait_for_healthy_sidecar(port, 40, Duration::from_millis(500)) {
+        let wait_attempts = if leaknipe_sidecar_on_port(port) { 80 } else { 40 };
+        if wait_for_healthy_sidecar(port, wait_attempts, Duration::from_millis(500)) {
             eprintln!("[leaksnipe-ui] Reusing sidecar on port {port} after extended wait");
             return Ok(SpawnOutcome {
                 child: None,
                 external: true,
             });
         }
-        eprintln!("[leaksnipe-ui] Port {port} still unhealthy after 20s - clearing stale listener");
-        free_api_port(port);
+        if leaknipe_sidecar_on_port(port) && !force {
+            eprintln!(
+                "[leaksnipe-ui] LeakSnipe sidecar on port {port} still warming up - not killing (external/retry path)"
+            );
+            return Ok(SpawnOutcome {
+                child: None,
+                external: true,
+            });
+        }
+        eprintln!("[leaksnipe-ui] Port {port} still unhealthy after extended wait - clearing stale listener");
+        stop_listeners_on_port(port, leaknipe_sidecar_on_port(port));
         if wait_for_healthy_sidecar(port, 24, Duration::from_millis(500)) {
             eprintln!("[leaksnipe-ui] Reusing sidecar on port {port} after peer startup");
             return Ok(SpawnOutcome {
@@ -833,17 +887,36 @@ fn get_api_base_url() -> String {
 #[tauri::command]
 fn sidecar_status(state: State<BackendProcess>) -> SidecarStatus {
     let port = api_port();
-    let last_error = state
-        .0
-        .lock()
-        .map(|g| g.last_error.clone())
-        .unwrap_or_default();
+    let (last_error, ownership, pid, restart_failures) = state.0.lock().map_or_else(
+        |_| (String::new(), "unknown".to_string(), None, 0),
+        |guard| {
+            let pid = guard.child.as_ref().map(Child::id);
+            let ownership = if pid.is_some() {
+                "tauri-managed"
+            } else if guard.external {
+                "external-launcher"
+            } else {
+                "none"
+            };
+            (
+                guard.last_error.clone(),
+                ownership.to_string(),
+                pid,
+                guard.restart_failures,
+            )
+        },
+    );
     SidecarStatus {
         healthy: sidecar_healthy_cached(port),
         deps_installed: sidecar_deps_installed(),
         port,
         log_path: sidecar_log_path().to_string_lossy().into_owned(),
         last_error,
+        ownership,
+        pid,
+        restart_failures,
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        repo_root: normalize_windows_path(&repo_root()),
     }
 }
 
