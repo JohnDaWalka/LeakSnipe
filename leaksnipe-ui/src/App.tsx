@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   api,
+  checkBackendHealth,
   getApiBase,
+  getSidecarStatus,
+  handSummaryToDetailPreview,
+  HEALTH_POLL_INTERVAL_MS,
+  launchSidecarWindow,
+  restartSidecar,
   waitForBackend,
   type Dashboard,
   type HandDetail,
@@ -9,18 +15,25 @@ import {
   type ImportStatus,
   type ScanDir,
   type Settings,
+  type SidecarStatus,
+  isDashboardStatsWarming,
 } from "./lib/api";
 import type { TabId } from "./types";
 import { AiCoachPanel } from "./components/AiCoachPanel";
+import { EquityCalculator } from "./components/EquityCalculator";
+import { TheoryPanel } from "./components/TheoryPanel";
 import { HandDetailPanel, HandReplayerModal } from "./components/HandDetail";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { StatsPanel } from "./components/StatsPanel";
+import { resolveHudBackend, syncLiveHud } from "./lib/hudManager";
 import "./App.css";
 
 const TABS: { id: TabId; label: string; hint: string }[] = [
   { id: "hands", label: "Hands", hint: "Click a hand for stats · Replay button opens the table replayer" },
   { id: "stats", label: "Stats", hint: "VPIP, PFR, position breakdown, leak alerts" },
   { id: "coach", label: "AI Coach", hint: "Session analysis & chat (OpenAI / Gemini free tier)" },
+  { id: "equity", label: "Equity", hint: "Monte Carlo equity — NLHE, Omaha Hi/Lo, 7-Card Stud & Stud Hi/Lo" },
+  { id: "theory", label: "Theory", hint: "CFR+ · stack charts · neural value (unified MTT theory)" },
   { id: "settings", label: "Settings", hint: "Hero names, watch folders, AI provider" },
 ];
 
@@ -52,37 +65,66 @@ function App() {
   const [hands, setHands] = useState<HandSummary[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [folders, setFolders] = useState<ScanDir[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [handsLoading, setHandsLoading] = useState(true);
   const [statsLoading, setStatsLoading] = useState(false);
+  const [statsError, setStatsError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [importStatus, setImportStatus] = useState<ImportStatus | null>(null);
   const [totalHands, setTotalHands] = useState(0);
+  const [dbPath, setDbPath] = useState<string | null>(null);
   const [selectedHandId, setSelectedHandId] = useState<string | null>(null);
   const [selectedHand, setSelectedHand] = useState<HandDetail | null>(null);
   const [replayerHand, setReplayerHand] = useState<HandDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
   const [replayerLoadingId, setReplayerLoadingId] = useState<string | null>(null);
+  const [hudError, setHudError] = useState<string | null>(null);
+  const [sidecarOnline, setSidecarOnline] = useState<boolean | null>(null);
+  const [sidecarStarting, setSidecarStarting] = useState(false);
+  const [sidecarStatus, setSidecarStatus] = useState<SidecarStatus | null>(null);
 
   const tableScrollRef = useRef<HTMLDivElement>(null);
   const handsCountRef = useRef(0);
+  const handsAbortRef = useRef<AbortController | null>(null);
+  const detailRequestRef = useRef(0);
+  const statsPollRef = useRef<number | null>(null);
+  const statsWarmStartedRef = useRef<number | null>(null);
+  const STATS_WARM_TIMEOUT_MS = 60_000;
 
   const refreshHands = useCallback(async (silent = false) => {
+    const controller = new AbortController();
+    // Silent polls must not abort an in-flight initial/manual load (was leaving handsLoading stuck).
+    if (!silent) {
+      handsAbortRef.current?.abort();
+      handsAbortRef.current = controller;
+      setHandsLoading(true);
+      setError(null);
+    }
+
     const scrollTop = silent ? (tableScrollRef.current?.scrollTop ?? 0) : 0;
-    if (!silent) setLoading(true);
-    setError(null);
     try {
-      await waitForBackend();
-      const [recent, cfg, watch, status] = await Promise.all([
-        api.recentHands(50),
-        api.settings(),
-        api.watchFolders(),
-        api.importStatus().catch(() => null),
-      ]);
-      setHands(recent.hands);
-      handsCountRef.current = recent.total ?? recent.hands.length;
-      setTotalHands(recent.total ?? recent.hands.length);
-      setSettings(cfg);
-      setFolders(watch);
+      const signal = controller.signal;
+      const [recentResult, settingsResult, foldersResult, statusResult] =
+        await Promise.allSettled([
+          api.recentHands(50, signal),
+          api.settings(signal),
+          api.watchFolders(signal),
+          api.importStatus(signal),
+        ]);
+      if (signal.aborted) return;
+      if (recentResult.status === "rejected") {
+        throw recentResult.reason;
+      }
+      const recent = recentResult.value;
+      setSidecarOnline(true);
+      setHands(recent.hands ?? []);
+      handsCountRef.current = recent.total ?? recent.hands?.length ?? 0;
+      setTotalHands(recent.total ?? recent.hands?.length ?? 0);
+      if (recent.db_path) setDbPath(recent.db_path);
+      if (settingsResult.status === "fulfilled") setSettings(settingsResult.value);
+      if (foldersResult.status === "fulfilled") setFolders(foldersResult.value);
+      const status =
+        statusResult.status === "fulfilled" ? statusResult.value : null;
       if (status) {
         setImportStatus(status);
         if (status.total_hands) setTotalHands(status.total_hands);
@@ -95,45 +137,159 @@ function App() {
         });
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (controller.signal.aborted) return;
+      const message = err instanceof Error ? err.message : String(err);
+      if (!silent || handsCountRef.current === 0) {
+        setError(message);
+      }
+      if (handsCountRef.current === 0) {
+        setSidecarOnline(false);
+      }
     } finally {
-      if (!silent) setLoading(false);
+      if (!silent && handsAbortRef.current === controller) {
+        setHandsLoading(false);
+        handsAbortRef.current = null;
+      }
     }
   }, []);
 
-  const refreshDashboard = useCallback(async (wait = false) => {
-    setStatsLoading(true);
+  const refreshDashboard = useCallback(async (silent = false, wait = false) => {
+    if (!silent) {
+      setStatsLoading(true);
+      setStatsError(null);
+    }
     try {
       const dash = await api.dashboard(wait);
       setDashboard(dash);
       setTotalHands(dash.total_hands);
       if (dash.import_status) setImportStatus(dash.import_status);
+      if (dash.stats_error) {
+        setStatsError(dash.stats_error);
+      } else if (!silent) {
+        setStatsError(null);
+      }
+      if (isDashboardStatsWarming(dash)) {
+        if (statsWarmStartedRef.current == null) {
+          statsWarmStartedRef.current = Date.now();
+        } else if (
+          Date.now() - statsWarmStartedRef.current > STATS_WARM_TIMEOUT_MS
+        ) {
+          const msg =
+            "Leak stats are taking longer than expected. The sidecar may be busy — try Retry or restart the sidecar from Settings.";
+          setStatsError(msg);
+          if (statsPollRef.current != null) {
+            window.clearInterval(statsPollRef.current);
+            statsPollRef.current = null;
+          }
+        }
+      } else {
+        statsWarmStartedRef.current = null;
+        if (!silent) setStatsError(null);
+      }
+      return dash;
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      setStatsError(message);
+      if (!silent) setError(message);
+      return null;
     } finally {
-      setStatsLoading(false);
+      if (!silent) setStatsLoading(false);
     }
   }, []);
+
+  const scheduleStatsWarmPoll = useCallback(() => {
+    if (statsPollRef.current != null) return;
+    statsPollRef.current = window.setInterval(() => {
+      void refreshDashboard(true).then((dash) => {
+        if (dash && !isDashboardStatsWarming(dash) && statsPollRef.current != null) {
+          window.clearInterval(statsPollRef.current);
+          statsPollRef.current = null;
+        }
+      });
+    }, 4000);
+  }, [refreshDashboard]);
 
   const refresh = useCallback(
     async (silent = false) => {
       await refreshHands(silent);
       if (activeTab === "stats") {
-        await refreshDashboard(true);
+        const dash = await refreshDashboard(silent);
+        if (dash && isDashboardStatsWarming(dash)) {
+          scheduleStatsWarmPoll();
+        }
       }
     },
-    [activeTab, refreshHands, refreshDashboard],
+    [activeTab, refreshHands, refreshDashboard, scheduleStatsWarmPoll],
   );
 
   useEffect(() => {
     void refreshHands();
+    return () => {
+      handsAbortRef.current?.abort();
+      if (statsPollRef.current != null) {
+        window.clearInterval(statsPollRef.current);
+        statsPollRef.current = null;
+      }
+    };
   }, [refreshHands]);
 
   useEffect(() => {
-    if (activeTab === "stats" && !dashboard && !statsLoading) {
-      void refreshDashboard(true);
+    let cancelled = false;
+    const poll = async () => {
+      const status = await getSidecarStatus();
+      if (!cancelled && status?.healthy) {
+        setSidecarOnline(true);
+        if (status) setSidecarStatus(status);
+        return;
+      }
+      const ok = await checkBackendHealth({ includeSidecarStatus: false });
+      if (cancelled) return;
+      if (ok) {
+        setSidecarOnline(true);
+        return;
+      }
+      if (!cancelled) {
+        setSidecarOnline(status?.healthy ?? false);
+        if (status) setSidecarStatus(status);
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), HEALTH_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [sidecarStarting]);
+
+  const startSidecar = async () => {
+    setSidecarStarting(true);
+    setError(null);
+    try {
+      try {
+        await launchSidecarWindow();
+      } catch {
+        await restartSidecar();
+      }
+      await waitForBackend(40, 250);
+      setSidecarOnline(true);
+      await refresh(true);
+    } catch (err) {
+      setSidecarOnline(false);
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSidecarStarting(false);
     }
-  }, [activeTab, dashboard, statsLoading, refreshDashboard]);
+  };
+
+  useEffect(() => {
+    if (activeTab !== "stats") return;
+    if (dashboard && !isDashboardStatsWarming(dashboard)) return;
+    void refreshDashboard(false).then((dash) => {
+      if (dash && isDashboardStatsWarming(dash)) {
+        scheduleStatsWarmPoll();
+      }
+    });
+  }, [activeTab, dashboard, refreshDashboard, scheduleStatsWarmPoll]);
 
   useEffect(() => {
     if (!settings?.auto_refresh) return;
@@ -143,12 +299,25 @@ function App() {
   }, [settings?.auto_refresh, settings?.refresh_interval, refreshHands]);
 
   useEffect(() => {
+    if (!settings) return;
+    const backend = resolveHudBackend(settings);
+    void syncLiveHud(!!settings.live_hud_enabled, backend)
+      .then(() => setHudError(null))
+      .catch((err) => {
+        setHudError(err instanceof Error ? err.message : String(err));
+      });
+  }, [settings?.live_hud_enabled, settings?.live_hud_backend]);
+
+  useEffect(() => {
     let cancelled = false;
     let source: EventSource | null = null;
 
     void (async () => {
       try {
-        await waitForBackend();
+        for (let i = 0; i < 40 && !cancelled; i++) {
+          if (await checkBackendHealth({ includeSidecarStatus: false })) break;
+          await new Promise((r) => setTimeout(r, 250));
+        }
         if (cancelled) return;
         const base = await getApiBase();
         source = new EventSource(`${base}/api/events`);
@@ -157,7 +326,7 @@ function App() {
             const data = JSON.parse(event.data) as { type?: string; count?: number };
             if (data.type === "new_hands" && (data.count ?? 0) > 0) {
               void refreshHands(true);
-              if (activeTab === "stats") void refreshDashboard(false);
+              if (activeTab === "stats") void refreshDashboard(true);
             }
           } catch {
             // ignore malformed SSE payloads
@@ -180,18 +349,28 @@ function App() {
   };
 
   const openHand = async (handId: string) => {
-    if (selectedHandId === handId && selectedHand) return;
+    if (selectedHandId === handId && selectedHand && !detailLoading && !detailError) return;
+
+    const preview = hands.find((h) => h.hand_id === handId);
+    const reqId = ++detailRequestRef.current;
+
     setSelectedHandId(handId);
+    setDetailError(null);
     setDetailLoading(true);
-    setSelectedHand(null);
+    setSelectedHand(preview ? handSummaryToDetailPreview(preview) : null);
+
     try {
       const hand = await fetchHand(handId);
+      if (detailRequestRef.current !== reqId) return;
       setSelectedHand(hand);
+      setDetailError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load hand");
-      setSelectedHandId(null);
+      if (detailRequestRef.current !== reqId) return;
+      setDetailError(err instanceof Error ? err.message : "Failed to load hand");
     } finally {
-      setDetailLoading(false);
+      if (detailRequestRef.current === reqId) {
+        setDetailLoading(false);
+      }
     }
   };
 
@@ -202,6 +381,8 @@ function App() {
       setReplayerHand(hand);
       setSelectedHandId(handId);
       setSelectedHand(hand);
+      setDetailError(null);
+      setDetailLoading(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load hand for replayer");
     } finally {
@@ -210,8 +391,11 @@ function App() {
   };
 
   const closeDetail = () => {
+    detailRequestRef.current += 1;
     setSelectedHandId(null);
     setSelectedHand(null);
+    setDetailError(null);
+    setDetailLoading(false);
   };
 
   const positionStats =
@@ -233,12 +417,16 @@ function App() {
             Refresh
           </button>
           <div className="status-pill" title={importStatus?.watch_folders?.map((f) => f.path).join("\n")}>
-            <span className={`status-dot ${importStatus?.watcher_running ? "" : "offline"}`} />
-            {loading
+            <span
+              className={`status-dot ${sidecarOnline === false ? "offline" : importStatus?.watcher_running ? "" : "offline"}`}
+            />
+            {handsLoading || sidecarStarting
               ? "Connecting…"
-              : importStatus?.watcher_running
-                ? `Watching ${importStatus.existing_folder_count} folder(s)`
-                : `${totalHands.toLocaleString()} hands`}
+              : sidecarOnline === false
+                ? "Sidecar offline"
+                : importStatus?.watcher_running
+                  ? `Watching ${importStatus.existing_folder_count} folder(s)`
+                  : `${totalHands.toLocaleString()} hands`}
           </div>
         </div>
       </header>
@@ -261,7 +449,55 @@ function App() {
           <h1 className="panel-title">{active.label}</h1>
           <p className="panel-subtitle">{active.hint}</p>
 
+          {sidecarOnline === false ? (
+            <div className="sidecar-offline-banner" role="alert">
+              <div>
+                <strong>Python sidecar not running</strong> — port 8765 is offline; your hand
+                database is safe.{" "}
+                {sidecarStatus?.deps_installed === false ? (
+                  <>
+                    Run <code className="mono">Install-Sidecar.bat</code> once from the repo folder,
+                    then <code className="mono">Start-Sidecar.bat</code> or click Start Sidecar.
+                  </>
+                ) : (
+                  <>
+                    Run <code className="mono">Start-Sidecar.bat</code> or click Start Sidecar below.
+                  </>
+                )}{" "}
+                Log: <code className="mono">%TEMP%\leaksnipe_sidecar.log</code>
+                {sidecarStatus?.last_error ? (
+                  <>
+                    {" "}
+                    — <span className="mono">{sidecarStatus.last_error}</span>
+                  </>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                className="primary-btn"
+                disabled={sidecarStarting}
+                onClick={() => void startSidecar()}
+              >
+                {sidecarStarting ? "Starting…" : "Start Sidecar"}
+              </button>
+            </div>
+          ) : null}
+
           {error ? <div className="error-banner">{error}</div> : null}
+          {hudError ? (
+            <div className="error-banner" role="alert">
+              Live HUD: {hudError}
+            </div>
+          ) : null}
+          {settings?.live_hud_enabled && !hudError ? (
+            resolveHudBackend(settings) === "tauri" ? (
+              <div className="success-banner">Tauri Live HUD overlay is active (experimental)</div>
+            ) : (
+              <div className="success-banner">
+                Live HUD enabled — open Settings and click Launch Python Live HUD
+              </div>
+            )
+          ) : null}
 
           {activeTab === "hands" ? (
             <div className={`hands-layout ${selectedHandId ? "with-drawer" : ""}`}>
@@ -270,8 +506,12 @@ function App() {
                   <div className="stat-card">
                     <div className="stat-label">Database</div>
                     <div className="stat-value mono small">
-                      {dashboard?.db_path?.split(/[/\\]/).pop() ?? "—"}
+                      {(dbPath ?? dashboard?.db_path)?.split(/[/\\]/).pop() ?? "—"}
                     </div>
+                  </div>
+                  <div className="stat-card">
+                    <div className="stat-label">In database</div>
+                    <div className="stat-value">{totalHands.toLocaleString()}</div>
                   </div>
                   <div className="stat-card">
                     <div className="stat-label">Showing</div>
@@ -291,6 +531,22 @@ function App() {
                       </tr>
                     </thead>
                     <tbody>
+                      {handsLoading && hands.length === 0 ? (
+                        <tr>
+                          <td colSpan={6} className="table-loading-hint">
+                            Loading hands…
+                          </td>
+                        </tr>
+                      ) : null}
+                      {!handsLoading && hands.length === 0 ? (
+                        <tr>
+                          <td colSpan={6} className="table-loading-hint">
+                            {sidecarOnline === false
+                              ? "Sidecar offline — start it with the banner above, then click Refresh."
+                              : "No hands yet — add watch folders in Settings and run Scan Now."}
+                          </td>
+                        </tr>
+                      ) : null}
                       {hands.map((hand) => (
                         <tr
                           key={hand.hand_id}
@@ -342,6 +598,14 @@ function App() {
                   <HandDetailPanel
                     hand={selectedHand}
                     loading={detailLoading}
+                    error={detailError}
+                    onRetry={
+                      selectedHandId
+                        ? () => {
+                            if (selectedHandId) void openHand(selectedHandId);
+                          }
+                        : undefined
+                    }
                     onClose={closeDetail}
                     onOpenReplayer={() => {
                       if (selectedHand) setReplayerHand(selectedHand);
@@ -356,15 +620,34 @@ function App() {
           ) : null}
 
           {activeTab === "stats" ? (
-            <StatsPanel dashboard={dashboard} loading={statsLoading || (!dashboard && loading)} />
+            <StatsPanel
+              dashboard={dashboard}
+              loading={statsLoading}
+              warming={Boolean(dashboard && isDashboardStatsWarming(dashboard) && !statsError)}
+              error={statsError}
+              onRetry={() => {
+                statsWarmStartedRef.current = null;
+                setStatsError(null);
+                void refreshDashboard(false).then((dash) => {
+                  if (dash && isDashboardStatsWarming(dash)) scheduleStatsWarmPoll();
+                });
+              }}
+            />
           ) : null}
 
           {activeTab === "coach" ? (
             <AiCoachPanel
               dashboard={dashboard}
               recentHandIds={hands.map((h) => h.hand_id)}
+              sidecarOnline={sidecarOnline}
+              handsLoading={handsLoading}
+              totalHands={totalHands}
             />
           ) : null}
+
+          {activeTab === "equity" ? <EquityCalculator /> : null}
+
+          {activeTab === "theory" ? <TheoryPanel /> : null}
 
           {activeTab === "settings" ? (
             <SettingsPanel
@@ -372,6 +655,11 @@ function App() {
               folders={folders}
               onSaved={(s) => {
                 setSettings(s);
+                void syncLiveHud(!!s.live_hud_enabled, resolveHudBackend(s))
+                  .then(() => setHudError(null))
+                  .catch((err) => {
+                    setHudError(err instanceof Error ? err.message : String(err));
+                  });
                 void refresh(true);
               }}
             />

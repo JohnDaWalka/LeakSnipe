@@ -1,6 +1,15 @@
-import { useState } from "react";
-import { api, type AiAnalysis, type HandDetail } from "../lib/api";
+import { useEffect, useState } from "react";
+import {
+  api,
+  formatAiProviderFromStatus,
+  type AiAnalysis,
+  type AiStatus,
+  type HandDetail,
+} from "../lib/api";
+import { HandAnalysisView } from "./HandAnalysisView";
 import { HandReplayer } from "./HandReplayer";
+import { OpponentHudPanel } from "./OpponentHud";
+import { AiVisualGenerator, type VisualPreset } from "./AiVisualGenerator";
 import { parseCardList, PlayingCard } from "./PlayingCard";
 
 export type PositionContext = {
@@ -17,6 +26,8 @@ type HandDetailPanelProps = {
   sessionVpip?: number;
   sessionPfr?: number;
   loading?: boolean;
+  error?: string | null;
+  onRetry?: () => void;
 };
 
 function formatWon(amount: number, isTournament: boolean) {
@@ -32,12 +43,24 @@ export function HandDetailPanel({
   sessionVpip,
   sessionPfr,
   loading,
+  error,
+  onRetry,
 }: HandDetailPanelProps) {
   const [analyzing, setAnalyzing] = useState(false);
   const [analysis, setAnalysis] = useState<AiAnalysis | null>(null);
   const [aiError, setAiError] = useState<string | null>(null);
+  const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
+  const [datasetHands, setDatasetHands] = useState<number | null>(null);
+  const [webContextUsed, setWebContextUsed] = useState(false);
 
-  if (loading || !hand) {
+  useEffect(() => {
+    api.aiStatus().then((s) => {
+      setAiStatus(s);
+      if (s.dataset_context_hands != null) setDatasetHands(s.dataset_context_hands);
+    }).catch(() => setAiStatus(null));
+  }, []);
+
+  if (!hand) {
     return (
       <div className="detail-panel detail-panel-loading">
         <div className="detail-skeleton" />
@@ -50,8 +73,16 @@ export function HandDetailPanel({
     setAnalyzing(true);
     setAiError(null);
     try {
+      const freshStatus = await api.aiStatus();
+      setAiStatus(freshStatus);
       const res = await api.analyzeHand(hand.hand_id);
-      setAnalysis(res.analysis);
+      if (res.dataset_context_hands != null) setDatasetHands(res.dataset_context_hands);
+      setWebContextUsed(Boolean(res.web_context_included ?? res.analysis.web_context_included));
+      setAnalysis({
+        ...res.analysis,
+        provider: res.analysis.provider ?? res.provider,
+        model: res.analysis.model ?? res.model,
+      });
     } catch (err) {
       setAiError(err instanceof Error ? err.message : "AI analysis failed");
     } finally {
@@ -59,7 +90,46 @@ export function HandDetailPanel({
     }
   };
 
+  const activeProviderLabel = formatAiProviderFromStatus(aiStatus);
+  const analyzingWithOllama =
+    aiStatus?.provider_chain?.[0] === "ollama" ||
+    (aiStatus?.ai_provider_pref === "ollama" &&
+      !aiStatus?.asi1_ready &&
+      Boolean(aiStatus?.ollama_ready));
+  const datasetContextActive =
+    Boolean(aiStatus?.ai_include_dataset_context ?? true) &&
+    (datasetHands ?? aiStatus?.dataset_context_hands ?? 0) > 0;
+  const webSearchMode = aiStatus?.ai_web_search_mode ?? (aiStatus?.ai_include_web_context === false ? "off" : "on_demand");
+  const webContextEnabled = webSearchMode !== "off";
+
   const heroCards = parseCardList(hand.hero_cards);
+  const boardCards = hand.board_cards ?? [];
+  const boardLoading = Boolean(loading && boardCards.length === 0 && !hand.streets?.length);
+  const opponentNames = Object.values(hand.players ?? {})
+    .filter((p) => !p.is_hero)
+    .map((p) => p.name);
+
+  const board = boardCards.join(" ");
+  const flop = boardCards.slice(0, 3).join(" ");
+  const visualPresets: VisualPreset[] = [];
+  if (flop) {
+    visualPresets.push({
+      label: "Board texture",
+      prompt: `A poker board texture diagram for the flop ${flop}, labeling draws, made hands, and how wet or dry the texture is`,
+    });
+  }
+  if (board) {
+    visualPresets.push({
+      label: "Full board",
+      prompt: `A poker board diagram showing the runout ${board}, highlighting completed draws and the strongest possible hands`,
+    });
+  }
+  if (hand.hero_position) {
+    visualPresets.push({
+      label: `${hand.hero_position} range`,
+      prompt: `A 13x13 preflop poker hand range grid chart for an opening range from the ${hand.hero_position} position`,
+    });
+  }
 
   return (
     <div className="detail-panel">
@@ -72,6 +142,17 @@ export function HandDetailPanel({
           ✕
         </button>
       </div>
+
+      {error ? (
+        <div className="error-banner" role="alert">
+          {error}
+          {onRetry ? (
+            <button type="button" className="ghost-btn small" onClick={onRetry} style={{ marginLeft: "0.5rem" }}>
+              Retry
+            </button>
+          ) : null}
+        </div>
+      ) : null}
 
       <button type="button" className="replay-hero-btn" onClick={onOpenReplayer}>
         <span className="replay-hero-icon" aria-hidden>▶</span>
@@ -128,61 +209,98 @@ export function HandDetailPanel({
         <div className="card-row">
           {heroCards.length > 0
             ? heroCards.map((c, i) => <PlayingCard key={i} card={c} />)
-            : <span className="muted">—</span>}
+            : loading
+              ? <span className="muted">Loading…</span>
+              : <span className="muted">—</span>}
         </div>
       </div>
 
-      {hand.board_cards?.length > 0 ? (
+      {boardCards.length > 0 ? (
         <div className="detail-cards-row">
           <span className="detail-label">Board</span>
           <div className="card-row">
-            {hand.board_cards.map((c, i) => (
+            {boardCards.map((c, i) => (
               <PlayingCard key={i} card={c} />
             ))}
           </div>
         </div>
+      ) : boardLoading ? (
+        <div className="detail-cards-row">
+          <span className="detail-label">Board</span>
+          <span className="muted">Loading board…</span>
+        </div>
+      ) : null}
+
+      {opponentNames.length > 0 ? (
+        <OpponentHudPanel names={opponentNames} title="Opponents" />
       ) : null}
 
       <div className="detail-actions">
-        <button type="button" className="secondary-btn" onClick={runAi} disabled={analyzing}>
-          {analyzing ? "Analyzing with Ollama…" : "AI Coach"}
+        <button type="button" className="secondary-btn" onClick={runAi} disabled={analyzing || Boolean(error)}>
+          {analyzing ? `Analyzing with ${activeProviderLabel}…` : "AI Coach"}
         </button>
+        {datasetContextActive ? (
+          <span className="muted small">
+            Grounded in your full database ({datasetHands ?? aiStatus?.dataset_context_hands} hands)
+          </span>
+        ) : null}
+        {webContextUsed ? (
+          <span className="muted small">Live web context used</span>
+        ) : webContextEnabled && !analyzing ? (
+          <span className="muted small">
+            Web search {webSearchMode === "always" ? "always on" : "on-demand (not used for hand grading)"}
+          </span>
+        ) : null}
       </div>
 
-      {analyzing ? (
+      {analyzing && analyzingWithOllama ? (
         <p className="muted ai-analyzing-hint">Local Ollama analysis can take 1–2 minutes on large models.</p>
+      ) : analyzing ? (
+        <p className="muted ai-analyzing-hint">Cloud analysis usually finishes in a few seconds.</p>
       ) : null}
 
       {aiError ? <div className="error-banner">{aiError}</div> : null}
       {analysis ? (
         <div className="ai-result">
           <div className="detail-label">AI Coach</div>
-          <p>{analysis.summary || (analysis as { analysis?: string }).analysis || "Analysis complete."}</p>
-          {analysis.play_style ? (
-            <p className="muted">Style: {analysis.play_style}</p>
-          ) : null}
-          {analysis.mistakes_found != null ? (
-            <p className="muted">Mistakes flagged: {analysis.mistakes_found}</p>
-          ) : null}
+          <HandAnalysisView analysis={analysis} />
+        </div>
+      ) : null}
+
+      {aiStatus?.asi1_image_ready ? (
+        <div className="ai-result">
+          <AiVisualGenerator
+            available
+            model={aiStatus?.asi1_image_model}
+            presets={visualPresets}
+            placeholder="Describe a visual for this hand…"
+            title="Generate Visual"
+          />
         </div>
       ) : null}
 
       <div className="streets-log">
         <div className="detail-label">Action Log</div>
-        {hand.streets?.map((street) => (
-          <div key={street.name} className="street-block">
-            <div className="street-name">
-              {street.name}
-              {street.cards?.length ? ` · ${street.cards.join(" ")}` : ""}
-            </div>
-            {street.actions?.map((act, i) => (
-              <div key={i} className="action-line mono">
-                {act.player}: {act.action}
-                {act.amount > 0 ? ` $${act.amount.toFixed(2)}` : ""}
+        {boardLoading ? (
+          <p className="muted">Loading actions…</p>
+        ) : hand.streets?.length ? (
+          hand.streets.map((street) => (
+            <div key={street.name} className="street-block">
+              <div className="street-name">
+                {street.name}
+                {street.cards?.length ? ` · ${street.cards.join(" ")}` : ""}
               </div>
-            ))}
-          </div>
-        ))}
+              {street.actions?.map((act, i) => (
+                <div key={i} className="action-line mono">
+                  {act.player}: {act.action}
+                  {act.amount > 0 ? ` $${act.amount.toFixed(2)}` : ""}
+                </div>
+              ))}
+            </div>
+          ))
+        ) : (
+          <p className="muted">No action log</p>
+        )}
       </div>
     </div>
   );
