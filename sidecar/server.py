@@ -229,7 +229,10 @@ def _refresh_stats_background(force: bool = False) -> None:
         global _stats_refresh_pending, _stats_warm_started
         with _stats_cache_lock:
             if _stats_refreshing:
-                _stats_refresh_pending = True
+                # Concurrent callers must not re-queue a full recompute. Only
+                # _invalidate_stats_cache sets _stats_refresh_pending after a real
+                # data change; otherwise startup dashboard/hands traffic doubles
+                # a multi-second LeakEngine pass and stalls the UI.
                 return
             now = time.time()
             if not force and _stats_cache and (now - _stats_cache_at) < STATS_CACHE_TTL_SEC:
@@ -750,7 +753,7 @@ def update_settings(body: SettingsUpdate) -> Dict[str, Any]:
 
 
 @app.get("/api/watch-folders")
-def watch_folders() -> List[Dict[str, str]]:
+def watch_folders() -> List[Dict[str, Any]]:
     settings = load_settings()
     return list(settings.get("scan_dirs", []))
 

@@ -108,6 +108,10 @@ if HAS_WATCHDOG:
             if not path:
                 return False
             p = path.lower()
+            # CoinPoker table_*.log files churn constantly and do not carry full hands.
+            name = os.path.basename(p)
+            if name.startswith("table_") and (name.endswith(".log") or name.endswith(".log.gz")):
+                return False
             return (
                 p.endswith(".txt") or p.endswith(".txt~") or p.endswith(".ots")
                 or p.endswith(".log") or p.endswith(".log.gz")
@@ -288,10 +292,21 @@ class HandImporter:
         except Exception as e:
             logging.error("Failed to parse tournament summary %s: %s", fpath, e, exc_info=True)
 
+    def _forget_tracked_file(self, fpath: str) -> None:
+        """Drop a path from import tracking (deleted/rotated files)."""
+        self.file_signatures.pop(fpath, None)
+        self.file_mtimes.pop(fpath, None)
+        self.files_scanned.discard(fpath)
+        self._coinpoker_seg_cache.pop(fpath, None)
+
     def _get_file_signature(self, fpath: str) -> Optional[Tuple[int, int, str]]:
         """Get file signature (mtime, size, tail hash)."""
         try:
             stat = os.stat(fpath)
+        except FileNotFoundError:
+            # Ephemeral CoinPoker table_*.log and rotated paths vanish constantly.
+            logging.debug("Hand history gone (untrack): %s", fpath)
+            return None
         except OSError as exc:
             logging.warning("Failed to stat hand history %s: %s", fpath, exc)
             return None
@@ -304,6 +319,9 @@ class HandImporter:
                 if size > 4096:
                     fh.seek(-4096, os.SEEK_END)
                 tail_hash = hashlib.sha1(fh.read()).hexdigest()
+        except FileNotFoundError:
+            logging.debug("Hand history gone while reading tail (untrack): %s", fpath)
+            return None
         except OSError as exc:
             logging.warning("Failed to read hand history tail %s: %s", fpath, exc)
             return None
@@ -339,6 +357,12 @@ class HandImporter:
         """True for CoinPoker rotating main logs: main.log / main.N.log.gz."""
         name = os.path.basename(fpath).lower()
         return bool(re.match(r"^main(?:\.\d+)?\.log(?:\.gz)?$", name))
+
+    @staticmethod
+    def _is_coinpoker_table_log(fpath: str) -> bool:
+        """True for ephemeral per-table Unity logs (hands live in main.log chain)."""
+        name = os.path.basename(fpath).lower()
+        return bool(re.match(r"^table_\d+\.log(?:\.gz)?$", name))
 
     def _coinpoker_chain(self, dirpath: str) -> List[str]:
         """Ordered CoinPoker main-log segments in a dir, oldest -> newest."""
@@ -435,6 +459,13 @@ class HandImporter:
         ):
             return 0, 0
 
+        # Per-table CoinPoker logs are transient UI dumps; complete hands come from
+        # the rotating main.log chain. Tracking them freezes poll loops after tables close.
+        if self._is_coinpoker_table_log(fpath):
+            with self.lock:
+                self._forget_tracked_file(fpath)
+            return 0, 0
+
         # CoinPoker rotating logs are imported as a stitched chain (see
         # _import_coinpoker_chain) so rotation-straddling hands keep their hole cards.
         if self._is_coinpoker_main_log(fpath):
@@ -443,6 +474,7 @@ class HandImporter:
         with self.lock:
             signature = self._get_file_signature(fpath)
             if signature is None:
+                self._forget_tracked_file(fpath)
                 return 0, 0
             if self.file_signatures.get(fpath) == signature:
                 return 0, 0
@@ -511,6 +543,7 @@ class HandImporter:
 
         saved = 0
         files_count = 0
+        coinpoker_chains_done: set = set()
         for entry in scan_dirs:
             path = os.path.normpath(entry["path"])
             site = entry["site"]
@@ -519,6 +552,17 @@ class HandImporter:
             if not os.path.isdir(path):
                 continue
             for root, dirs, files in os.walk(path):
+                # CoinPoker: import the stitched main.log chain once per directory.
+                if site == "CoinPoker" or any(
+                    self._is_coinpoker_main_log(os.path.join(root, f)) for f in files
+                ):
+                    root_key = os.path.normcase(os.path.normpath(root))
+                    if root_key not in coinpoker_chains_done and self._coinpoker_chain(root):
+                        coinpoker_chains_done.add(root_key)
+                        file_saved, scanned = self._import_coinpoker_chain(root)
+                        if scanned:
+                            saved += file_saved
+                            files_count += scanned
                 for fname in files:
                     ext = fname.lower()
                     if not (
@@ -527,6 +571,9 @@ class HandImporter:
                     ):
                         continue
                     fpath = os.path.join(root, fname)
+                    if self._is_coinpoker_table_log(fpath) or self._is_coinpoker_main_log(fpath):
+                        # table_*: skip; main.*: already handled via chain above
+                        continue
                     file_saved, scanned = self._import_file(fpath, site)
                     if scanned:
                         saved += file_saved
@@ -681,10 +728,24 @@ class HandImporter:
 
     def get_status(self) -> Dict[str, Any]:
         """Watcher/import status for the UI."""
+        import time as _time
+
+        # Cache path existence briefly — this status is hit on every recent-hands poll
+        # and _path_exists_quick can take up to 1s per slow/missing folder.
+        cache = getattr(self, "_path_exists_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._path_exists_cache = cache
+        now = _time.monotonic()
         dirs = []
         for entry in self.settings.get("scan_dirs", []):
             path = os.path.normpath(str(entry.get("path", "")).strip())
-            exists = _path_exists_quick(path)
+            cached = cache.get(path)
+            if cached and (now - cached[0]) < 30.0:
+                exists = cached[1]
+            else:
+                exists = _path_exists_quick(path, timeout_sec=0.35)
+                cache[path] = (now, exists)
             dirs.append({
                 "path": path,
                 "site": str(entry.get("site", "")).strip(),
@@ -713,6 +774,13 @@ class HandImporter:
             with self.lock:
                 tracked = list(self.file_signatures.keys())
             for fpath in tracked:
+                if self._is_coinpoker_table_log(fpath):
+                    with self.lock:
+                        self._forget_tracked_file(fpath)
+                    continue
+                if self._is_coinpoker_main_log(fpath):
+                    # Main segments are covered by the per-dir chain import below.
+                    continue
                 file_saved, scanned = self._import_file(
                     fpath, self._site_for_path(fpath),
                 )
@@ -720,6 +788,7 @@ class HandImporter:
                     saved += file_saved
                     files_count += 1
 
+            coinpoker_dirs_done: set = set()
             for entry in _prune_nested_scan_dirs(list(self.settings.get("scan_dirs", []))):
                 root = os.path.normpath(str(entry.get("path", "")).strip())
                 site = str(entry.get("site", "")).strip() or "BetACR"
@@ -729,11 +798,24 @@ class HandImporter:
                     names = os.listdir(root)
                 except OSError:
                     continue
+                # Prefer one CoinPoker main-chain import per logs directory.
+                if site == "CoinPoker" or any(
+                    self._is_coinpoker_main_log(os.path.join(root, n)) for n in names
+                ):
+                    root_key = os.path.normcase(root)
+                    if root_key not in coinpoker_dirs_done and self._coinpoker_chain(root):
+                        coinpoker_dirs_done.add(root_key)
+                        file_saved, scanned = self._import_coinpoker_chain(root)
+                        if scanned:
+                            saved += file_saved
+                            files_count += scanned
                 for fname in names:
                     low = fname.lower()
                     if not (low.endswith(".log") or low.endswith(".log.gz")):
                         continue
                     fpath = os.path.join(root, fname)
+                    if self._is_coinpoker_table_log(fpath) or self._is_coinpoker_main_log(fpath):
+                        continue
                     file_saved, scanned = self._import_file(fpath, site)
                     if scanned:
                         saved += file_saved

@@ -1,14 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
-  copyToClipboard,
   formatAiProviderFromStatus,
-  formatHandForClipboard,
   isOllamaProviderRef,
   type AiAnalysis,
   type AiStatus,
   type HandDetail,
-  type MRatioResult,
 } from "../lib/api";
 import { HandAnalysisView } from "./HandAnalysisView";
 import { HandReplayer } from "./HandReplayer";
@@ -23,6 +20,128 @@ export type PositionContext = {
   total: number;
 };
 
+export type MRatioResult = {
+  m_ratio: number;
+  effective_m: number;
+  zone: string;
+  zone_color: string;
+  stack_bb: number;
+};
+
+function formatHandForClipboard(hand: HandDetail): string {
+  const parts: string[] = [];
+  parts.push(`LeakSnipe Hand History`);
+  parts.push(`Site: ${hand.site}`);
+  if (hand.date) parts.push(`Date: ${hand.date}`);
+  parts.push(`Table: ${hand.table_name}`);
+  parts.push(`Game: ${hand.game_type}`);
+  parts.push(`Hero: ${hand.hero_name} (${hand.hero_position})`);
+  parts.push(`Hero cards: ${hand.hero_cards}`);
+  if (hand.board_cards && hand.board_cards.length > 0) {
+    parts.push(`Board: ${hand.board_cards.join(" ")}`);
+  }
+  parts.push(`Pot: ${hand.is_tournament ? `${(hand.pot ?? 0).toLocaleString()} chips` : `$${(hand.pot ?? 0).toFixed(2)}`}`);
+  if (hand.hero_won !== 0) {
+    parts.push(`Hero won: ${hand.is_tournament ? `${(hand.hero_won ?? 0).toLocaleString()} chips` : `$${(hand.hero_won ?? 0).toFixed(2)}`}`);
+  }
+  
+  if (hand.streets && hand.streets.length > 0) {
+    parts.push(`\nActions:`);
+    hand.streets.forEach((street) => {
+      parts.push(`--- ${street.name} ---`);
+      if (street.cards && street.cards.length > 0) {
+        parts.push(`Cards: ${street.cards.join(" ")}`);
+      }
+      street.actions?.forEach((act) => {
+        const amtStr = act.amount > 0 ? ` $${act.amount.toFixed(2)}` : "";
+        parts.push(`${act.player}: ${act.action}${amtStr}`);
+      });
+    });
+  }
+  return parts.join("\n");
+}
+
+function calculateMRatio(hand: HandDetail): MRatioResult | null {
+  const heroInfo = Object.values(hand.players ?? {}).find((p) => p?.is_hero);
+  if (!heroInfo) return null;
+  const heroStack = heroInfo.stack;
+  
+  let sb = 0;
+  let bb = 0;
+  let totalAntes = 0;
+  let numPlayersWithAntes = 0;
+  
+  const preflop = hand.streets?.find((s) => s.name?.toLowerCase() === "preflop");
+  if (!preflop || !preflop.actions) return null;
+  
+  preflop.actions.forEach((act) => {
+    const actName = act.action.toLowerCase();
+    if (actName.includes("small blind")) {
+      sb = Math.max(sb, act.amount);
+    } else if (actName.includes("big blind")) {
+      bb = Math.max(bb, act.amount);
+    } else if (actName.includes("ante")) {
+      totalAntes += act.amount;
+      numPlayersWithAntes++;
+    }
+  });
+  
+  if (sb === 0 || bb === 0) {
+    const postedAmounts = new Set<number>();
+    preflop.actions.forEach((act) => {
+      const actName = act.action.toLowerCase();
+      if (actName.includes("post") || actName.includes("blind")) {
+        postedAmounts.add(act.amount);
+      }
+    });
+    const sorted = Array.from(postedAmounts).sort((a, b) => b - a);
+    if (sorted.length >= 2) {
+      bb = sorted[0];
+      sb = sorted[1];
+    } else if (sorted.length === 1) {
+      bb = sorted[0];
+      sb = sorted[0] / 2;
+    }
+  }
+  
+  if (bb === 0) return null;
+  
+  const activePlayersCount = Object.keys(hand.players ?? {}).length || 9;
+  const antePerPlayer = numPlayersWithAntes > 0 ? (totalAntes / numPlayersWithAntes) : 0;
+  const totalAnteCost = totalAntes > 0 ? totalAntes : (antePerPlayer * activePlayersCount);
+  
+  const roundCost = sb + bb + totalAnteCost;
+  if (roundCost <= 0) return null;
+  
+  const mRatio = heroStack / roundCost;
+  const effectiveM = mRatio * (activePlayersCount / 10);
+  const stackBb = heroStack / bb;
+  
+  let zone = "green";
+  let zoneColor = "#22c55e";
+  if (mRatio < 1) {
+    zone = "dead";
+    zoneColor = "#64748b";
+  } else if (mRatio < 5) {
+    zone = "red";
+    zoneColor = "#ef4444";
+  } else if (mRatio < 10) {
+    zone = "orange";
+    zoneColor = "#f97316";
+  } else if (mRatio < 20) {
+    zone = "yellow";
+    zoneColor = "#eab308";
+  }
+  
+  return {
+    m_ratio: mRatio,
+    effective_m: effectiveM,
+    zone,
+    zone_color: zoneColor,
+    stack_bb: stackBb
+  };
+}
+
 type HandDetailPanelProps = {
   hand?: HandDetail | null;
   onClose: () => void;
@@ -33,6 +152,8 @@ type HandDetailPanelProps = {
   loading?: boolean;
   autoAnalyze?: boolean;
   onAutoAnalyzeComplete?: () => void;
+  error?: string | null;
+  onRetry?: () => void;
 };
 
 function formatWon(amount: number | null | undefined, isTournament: boolean) {
@@ -50,6 +171,8 @@ export function HandDetailPanel({
   loading,
   autoAnalyze,
   onAutoAnalyzeComplete,
+  error,
+  onRetry,
 }: HandDetailPanelProps) {
   const [analyzing, setAnalyzing] = useState(false);
   const [analysis, setAnalysis] = useState<AiAnalysis | null>(null);
@@ -57,14 +180,17 @@ export function HandDetailPanel({
   const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
   const [datasetHands, setDatasetHands] = useState<number | null>(null);
   const [webContextUsed, setWebContextUsed] = useState(false);
-  const [handMRatio, setHandMRatio] = useState<MRatioResult | null>(null);
   const [copyMessage, setCopyMessage] = useState<string | null>(null);
   const [copyError, setCopyError] = useState<string | null>(null);
   const autoTriggeredRef = useRef(false);
 
   const shownCards = useMemo(() => parseShownCards(hand?.raw_text ?? ""), [hand?.raw_text]);
 
-  // runAi defined at top level (before any early returns or effects) so auto-trigger can always call it
+  const handMRatio = useMemo(() => {
+    if (!hand || !hand.is_tournament) return null;
+    return calculateMRatio(hand);
+  }, [hand]);
+
   const runAi = async () => {
     if (!hand) return;
     setAnalyzing(true);
@@ -93,21 +219,16 @@ export function HandDetailPanel({
   }, []);
 
   useEffect(() => {
-    setHandMRatio(null);
     setAnalysis(null);
     setAiError(null);
     setAnalyzing(false);
     autoTriggeredRef.current = false;
     setCopyMessage(null);
     setCopyError(null);
-    if (!hand?.is_tournament) return;
-    api.handMRatio(hand.hand_id).then(setHandMRatio).catch(() => setHandMRatio(null));
-  }, [hand?.hand_id, hand?.is_tournament]);
+  }, [hand?.hand_id]);
 
-  // Auto-run AI analysis when right-click "export to AI" opens the hand
   useEffect(() => {
     if (autoAnalyze) {
-      // allow re-trigger if user right-clicks export again on the open hand
       autoTriggeredRef.current = false;
     }
     if (autoAnalyze && hand && !autoTriggeredRef.current) {
@@ -137,7 +258,7 @@ export function HandDetailPanel({
 
   const heroCards = parseCardList(hand.hero_cards ?? "");
   const opponentNames = Object.values(hand.players ?? {})
-    .filter((p) => p && !p.is_hero && p.name && p.name !== hand.hero_name)
+    .filter((p) => p && !p.is_hero)
     .map((p) => p.name);
 
   const formatStack = (amount: number | null | undefined) => {
@@ -151,20 +272,14 @@ export function HandDetailPanel({
   const visualPresets: VisualPreset[] = [];
   if (flop) {
     visualPresets.push({
-      label: "Board texture",
-      prompt: `A poker board texture diagram for the flop ${flop}, labeling draws, made hands, and how wet or dry the texture is`,
+      label: "Visual Flop Texture",
+      prompt: `photorealistic cinematic high dynamic range view of Texas Holdem poker table felt, board showing three cards: ${flop}, clean layout, studio lighting`,
     });
   }
   if (board) {
     visualPresets.push({
-      label: "Full board",
-      prompt: `A poker board diagram showing the runout ${board}, highlighting completed draws and the strongest possible hands`,
-    });
-  }
-  if (hand.hero_position) {
-    visualPresets.push({
-      label: `${hand.hero_position} range`,
-      prompt: `A 13x13 preflop poker hand range grid chart for an opening range from the ${hand.hero_position} position`,
+      label: "Visual Full Board",
+      prompt: `photorealistic cinematic high dynamic range view of Texas Holdem poker table felt, board showing cards: ${board}, clean layout, studio lighting`,
     });
   }
 
@@ -180,6 +295,17 @@ export function HandDetailPanel({
         </button>
       </div>
 
+      {error ? (
+        <div className="error-banner" role="alert">
+          {error}
+          {onRetry ? (
+            <button type="button" className="ghost-btn small" onClick={onRetry} style={{ marginLeft: "0.5rem" }}>
+              Retry
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
       <button type="button" className="replay-hero-btn" onClick={onOpenReplayer}>
         <span className="replay-hero-icon" aria-hidden>▶</span>
         Replay Hand
@@ -187,7 +313,6 @@ export function HandDetailPanel({
 
       <OpponentHudPanel names={opponentNames} title="Opponent Profiles" />
 
-      {/* Players at Table Section */}
       <div className="table-players-section">
         <h3 className="section-title">Players at Table</h3>
         <div className="table-players-list">
@@ -313,9 +438,12 @@ export function HandDetailPanel({
             setCopyMessage(null);
             setCopyError(null);
             const text = formatHandForClipboard(hand);
-            const ok = await copyToClipboard(text);
-            if (ok) setCopyMessage("Hand copied to clipboard.");
-            else setCopyError("Clipboard copy failed. Reopen the app after updating, then try again.");
+            try {
+              await navigator.clipboard.writeText(text);
+              setCopyMessage("Hand copied to clipboard.");
+            } catch {
+              setCopyError("Clipboard copy failed. Reopen the app after updating, then try again.");
+            }
           }}
           title="Copy hand (hole cards, board, actions, outcome) to clipboard — pasteable for AI"
         >

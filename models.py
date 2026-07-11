@@ -155,6 +155,18 @@ class HandDatabase:
                         wtsd REAL DEFAULT 0,
                         updated_at TEXT
                     );
+                    CREATE TABLE IF NOT EXISTS tournament_summaries (
+                        tournament_id TEXT PRIMARY KEY,
+                        site TEXT NOT NULL,
+                        buy_in_raw TEXT,
+                        buy_in_value REAL DEFAULT 0,
+                        rake_value REAL DEFAULT 0,
+                        player_count INTEGER DEFAULT 0,
+                        finish_position INTEGER,
+                        prize REAL DEFAULT 0,
+                        hero_name TEXT,
+                        imported_at TEXT
+                    );
                     CREATE INDEX IF NOT EXISTS idx_hands_date ON hands(date DESC);
                     CREATE INDEX IF NOT EXISTS idx_players_hand_id ON players(hand_id);
                     CREATE INDEX IF NOT EXISTS idx_actions_hand_id_seq ON actions(hand_id, sequence);
@@ -443,54 +455,60 @@ class HandDatabase:
 
     def get_hands_page(self, limit: int, offset: int = 0) -> List[Hand]:
         """Load a page of hands ordered by date (does not load entire DB)."""
-        with self.lock:
-            conn = self._connect()
-            try:
-                conn.row_factory = sqlite3.Row
-                c = conn.cursor()
-                rows = c.execute(
-                    "SELECT * FROM hands ORDER BY date DESC LIMIT ? OFFSET ?",
-                    (limit, offset),
-                ).fetchall()
-                if not rows:
-                    return []
-                hand_ids = [row["hand_id"] for row in rows]
-                players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand = (
-                    self._load_related_for_ids(c, hand_ids)
+        # Read path: skip process-wide lock so stats get_all_hands cannot stall the UI.
+        conn = self._connect()
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                "SELECT * FROM hands ORDER BY date DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+            if not rows:
+                return []
+            hand_ids = [row["hand_id"] for row in rows]
+            players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand = (
+                self._load_related_for_ids(c, hand_ids)
+            )
+            return [
+                self._hydrate_hand(
+                    row, players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand
                 )
-                return [
-                    self._hydrate_hand(
-                        row, players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand
-                    )
-                    for row in rows
-                ]
-            finally:
-                conn.close()
+                for row in rows
+            ]
+        finally:
+            conn.close()
 
     def get_all_hands(self) -> List[Hand]:
-        """Retrieve all hands from the database."""
-        with self.lock:
-            conn = self._connect()
-            try:
-                conn.row_factory = sqlite3.Row
-                c = conn.cursor()
-                rows = c.execute("SELECT * FROM hands ORDER BY date DESC").fetchall()
-                if not rows:
-                    return []
+        """Retrieve all hands from the database.
 
-                hand_ids = [row["hand_id"] for row in rows]
-                players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand = (
-                    self._load_related_for_ids(c, hand_ids)
+        Uses a dedicated connection without the process-wide lock so long stats
+        warmups (10k+ hands) do not freeze the sidecar UI API for several seconds.
+        WAL + busy_timeout still serialize writers safely.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute("SELECT * FROM hands ORDER BY date DESC").fetchall()
+            if not rows:
+                return []
+
+            hand_ids = [row["hand_id"] for row in rows]
+            players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand = (
+                self._load_related_for_ids(c, hand_ids)
+            )
+
+            return [
+                self._hydrate_hand(
+                    row, players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand
                 )
-
-                return [
-                    self._hydrate_hand(
-                        row, players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand
-                    )
-                    for row in rows
-                ]
-            finally:
-                conn.close()
+                for row in rows
+            ]
+        finally:
+            conn.close()
 
     def get_hand_count(self) -> Dict[str, int]:
         """Get count of hands per site."""
@@ -749,3 +767,46 @@ class HandDatabase:
                 return {r[0] for r in rows}
             finally:
                 conn.close()
+
+    def save_tournament_summary(self, summary: dict) -> None:
+        """Save a tournament summary to the database."""
+        with self.lock:
+            conn = self._connect()
+            try:
+                conn.execute("""
+                    INSERT OR REPLACE INTO tournament_summaries (
+                        tournament_id, site, buy_in_raw, buy_in_value, rake_value,
+                        player_count, finish_position, prize, hero_name, imported_at
+                    ) VALUES (
+                        :tournament_id, :site, :buy_in_raw, :buy_in_value, :rake_value,
+                        :player_count, :finish_position, :prize, :hero_name, :imported_at
+                    )
+                """, {
+                    "tournament_id": summary.get("tournament_id"),
+                    "site": summary.get("site"),
+                    "buy_in_raw": summary.get("buy_in_raw"),
+                    "buy_in_value": summary.get("buy_in_value", 0),
+                    "rake_value": summary.get("rake_value", 0),
+                    "player_count": summary.get("player_count", 0),
+                    "finish_position": summary.get("finish_position"),
+                    "prize": summary.get("prize", 0.0),
+                    "hero_name": summary.get("hero_name"),
+                    "imported_at": summary.get("imported_at")
+                })
+                conn.commit()
+            finally:
+                conn.close()
+
+    def get_tournament_summaries(self) -> List[Dict[str, Any]]:
+        """Retrieve all tournament summaries."""
+        with self.lock:
+            conn = self._connect()
+            try:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute("""
+                    SELECT * FROM tournament_summaries ORDER BY imported_at DESC
+                """)
+                return [dict(row) for row in cursor.fetchall()]
+            finally:
+                conn.close()
+
