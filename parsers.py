@@ -273,6 +273,10 @@ class HandParser:
             return self._parse_dh2_xml(text, site)
 
         if site == "CoinPoker":
+            if _COINPOKER_JSON_DETECT_RE.search(text) or '"cmd_bean"' in text or 'SendMessageToPipe' in text:
+                events = self._extract_coinpoker_events(text)
+                hands = self._build_coinpoker_hands(events)
+                return hands[0] if hands else None
             return self._parse_coinpoker(text)
         elif site in ("ACR", "BetACR"):
             return self._parse_acr(text, site_label="BetACR")
@@ -558,6 +562,10 @@ class HandParser:
                     h.button_seat = int(init.get("dealerSeatId") or 0)
                 if not h.tournament_id and init.get("tableId"):
                     h.tournament_id = str(int(float(init.get("tableId"))))
+                room_props = bean.get("roomProperties") or init.get("roomProperties") or {}
+                game_type_str = str(room_props.get("gameType") or "").upper()
+                if game_type_str:
+                    h.is_tournament = "RING" not in game_type_str and "CASH" not in game_type_str
                 seat_block = (
                     bean.get("seatInfoRsponseData")
                     or bean.get("seatInfoResponseData")

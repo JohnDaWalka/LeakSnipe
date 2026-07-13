@@ -56,19 +56,25 @@ def resolve_hand_hero_name(
             if info.get("is_hero") and info.get("name"):
                 return str(info["name"])
         seat_names = {str(info.get("name", "")) for info in players.values() if info.get("name")}
+        seat_names_lower = {name.lower() for name in seat_names}
         for alias in hero_aliases_from_settings(settings, site):
-            if alias in seat_names:
+            if alias.lower() in seat_names_lower:
+                for name in seat_names:
+                    if name.lower() == alias.lower():
+                        return name
                 return alias
     if raw_text:
         dealt: List[str] = []
-        for match in re.finditer(r"Dealt to (.+?) \[(.+?)\]", raw_text):
+        for match in re.finditer(r"Dealt to (.+?) \[(.+?)\]", raw_text, re.IGNORECASE):
             name = match.group(1).strip()
             if name and name not in dealt:
                 dealt.append(name)
         if dealt:
+            dealt_lower = [d.lower() for d in dealt]
             for alias in hero_aliases_from_settings(settings, site):
-                if alias in dealt:
-                    return alias
+                if alias.lower() in dealt_lower:
+                    idx = dealt_lower.index(alias.lower())
+                    return dealt[idx]
             return dealt[0]
     aliases = hero_aliases_from_settings(settings, site)
     return aliases[0] if aliases else ""
