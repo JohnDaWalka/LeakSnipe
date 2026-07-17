@@ -88,7 +88,7 @@
       }
     }
   },
-  "ai_provider": "anthropic",
+  "ai_provider": "asi1",
   "ollama_model": "qwen2.5:7b",
   "ai_include_dataset_context": true,
   "ai_web_search_mode": "on_demand",

@@ -7,7 +7,7 @@ import requests
 from datetime import datetime
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "poker_hands.db")
-API_BASE = "https://leaksnipe.win"
+API_BASE = "https://leaksnipe-proxy.gitgoin87.workers.dev"
 STAGGER_DELAY = 1.0
 
 # How often to poll the DB file's mtime for changes (cheap stat() call, not a

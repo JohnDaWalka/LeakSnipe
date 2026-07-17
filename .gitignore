@@ -99,3 +99,15 @@ PokerBuild/tsc_out.txt
 PokerBuild/vite_out.txt
 PokerBuild/eb_out.txt
 
+# Wrangler local dev state (not for version control)
+.wrangler/
+*/.wrangler/
+
+# Compiled Go binaries
+poker-daemon/poker-daemon.exe
+poker-daemon/*.exe
+
+# Local debug / capture images
+logs/*.png
+logs/*.jpg
+
