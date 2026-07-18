@@ -201,6 +201,136 @@ def query_and_serialize_hands(db, settings, sql, params):
         finally:
             conn.close()
 
+def calculate_sessions(db, settings, site=None, gap_minutes=30, limit=10):
+    from collections import defaultdict
+    sql = "SELECT hand_id, date, site, hero_won, is_tournament, hero_position FROM hands"
+    params = []
+    where_clauses = []
+    if site:
+        where_clauses.append("site = ?")
+        params.append(site)
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses)
+    sql += " ORDER BY date ASC"
+    
+    with db.lock:
+        conn = db._connect()
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+            
+    if not rows:
+        return []
+        
+    hands_by_site = defaultdict(list)
+    for r in rows:
+        hands_by_site[r["site"]].append(r)
+        
+    sessions = []
+    gap_seconds = gap_minutes * 60
+    
+    for current_site, site_hands in hands_by_site.items():
+        if not site_hands:
+            continue
+            
+        current_session = []
+        last_time = None
+        
+        for h in site_hands:
+            h_date_str = h["date"]
+            if not h_date_str:
+                continue
+            try:
+                h_date = datetime.fromisoformat(h_date_str)
+            except Exception:
+                continue
+                
+            if last_time is not None:
+                diff = (h_date - last_time).total_seconds()
+                if diff > gap_seconds:
+                    sessions.append((current_site, current_session))
+                    current_session = []
+            
+            current_session.append({
+                "hand_id": h["hand_id"],
+                "date": h_date,
+                "hero_won": h["hero_won"] or 0.0,
+                "is_tournament": bool(h["is_tournament"]),
+                "position": h["hero_position"]
+            })
+            last_time = h_date
+            
+        if current_session:
+            sessions.append((current_site, current_session))
+            
+    summary_sessions = []
+    for idx, (sess_site, sess) in enumerate(sessions):
+        if not sess:
+            continue
+        first_hand = sess[0]
+        last_hand = sess[-1]
+        
+        hand_count = len(sess)
+        total_won = sum(h["hero_won"] for h in sess)
+        won_hands = sum(1 for h in sess if h["hero_won"] > 0)
+        lost_hands = sum(1 for h in sess if h["hero_won"] < 0)
+        
+        duration = (last_hand["date"] - first_hand["date"]).total_seconds()
+        duration_minutes = round(duration / 60, 1)
+        
+        winrate_pct = round((won_hands / hand_count) * 100, 1) if hand_count > 0 else 0.0
+        
+        summary_sessions.append({
+            "session_index": idx + 1,
+            "site": sess_site,
+            "start_time": first_hand["date"].isoformat(),
+            "end_time": last_hand["date"].isoformat(),
+            "hand_count": hand_count,
+            "net_profit": round(total_won, 2),
+            "won_hands": won_hands,
+            "lost_hands": lost_hands,
+            "winrate_pct": winrate_pct,
+            "duration_minutes": duration_minutes,
+            "hands_per_hour": round(hand_count / (duration / 3600), 1) if duration > 60 else hand_count
+        })
+        
+    summary_sessions.sort(key=lambda s: s["start_time"], reverse=True)
+    return summary_sessions[:limit]
+
+def exec_cmd(cmd_list, cwd=None):
+    try:
+        import subprocess
+        cmd_str = " ".join(cmd_list)
+        res = subprocess.run(
+            cmd_str,
+            cwd=cwd,
+            shell=True,
+            capture_output=True,
+            timeout=30
+        )
+        
+        def safe_decode(b):
+            if not b:
+                return ""
+            for encoding in ['utf-8', 'cp1252', 'cp850']:
+                try:
+                    return b.decode(encoding)
+                except UnicodeDecodeError:
+                    continue
+            return b.decode('utf-8', errors='replace')
+
+        return {
+            "stdout": safe_decode(res.stdout),
+            "stderr": safe_decode(res.stderr),
+            "exit_code": res.returncode
+        }
+    except Exception as e:
+        return {
+            "error": str(e)
+        }
+
 def handle_request(req):
     method = req.get("method")
     params = req.get("params", {})
@@ -350,6 +480,63 @@ def handle_request(req):
                             },
                             "required": ["hand_id", "tag"]
                         }
+                    },
+                    {
+                        "name": "get_sessions_winrate",
+                        "description": "Calculate poker sessions dynamically based on gap minutes and return session winrate, profit, and duration.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "site": {"type": "string", "description": "Filter by poker site (e.g. 'CoinPoker', 'BetACR')"},
+                                "gap_minutes": {"type": "integer", "description": "Minutes gap between hands to define a new session (default 30)"},
+                                "limit": {"type": "integer", "description": "Max sessions to return (default 10)"}
+                            }
+                        }
+                    },
+                    {
+                        "name": "run_network_command",
+                        "description": "Execute network diagnostics and tools (ipconfig, ping, tracert, nslookup, netstat, arp, route).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "command": {
+                                    "type": "string", 
+                                    "enum": ["ipconfig", "ping", "tracert", "nslookup", "netstat", "arp", "route", "getmac"],
+                                    "description": "Network tool to run"
+                                },
+                                "args": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "List of arguments to pass to the command (e.g. ['-ano'] or ['db.leaksnipe.win'])"
+                                }
+                            },
+                            "required": ["command"]
+                        }
+                    },
+                    {
+                        "name": "run_cloudflare_command",
+                        "description": "Execute Cloudflare wrangler or cloudflared commands to inspect configuration, tunnels, D1, or R2.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "command": {
+                                    "type": "string",
+                                    "enum": ["wrangler", "cloudflared"],
+                                    "description": "Command to execute"
+                                },
+                                "args": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Arguments to pass (e.g. ['tunnel', 'list'] or ['whoami'])"
+                                },
+                                "sub_project": {
+                                    "type": "string",
+                                    "enum": ["root", "mcp-server", "cloudflare-api", "poker-daemon-worker"],
+                                    "description": "Working directory context to run wrangler command (default: 'root')"
+                                }
+                            },
+                            "required": ["command", "args"]
+                        }
                     }
                 ]
             }
@@ -467,6 +654,66 @@ def handle_request(req):
                 tag = args.get("tag")
                 db.remove_tag(hand_id, tag)
                 return json_rpc_success(req_id, {"ok": True, "tags": db.get_tags(hand_id)})
+
+            elif tool_name == "get_sessions_winrate":
+                site = args.get("site")
+                gap_minutes = args.get("gap_minutes", 30)
+                limit = min(args.get("limit", 10), 100)
+                sessions = calculate_sessions(db, settings, site=site, gap_minutes=gap_minutes, limit=limit)
+                return json_rpc_success(req_id, {"sessions": sessions})
+
+            elif tool_name == "run_network_command":
+                cmd = args.get("command")
+                cmd_args = args.get("args", [])
+                if cmd not in ["ipconfig", "ping", "tracert", "nslookup", "netstat", "arp", "route", "getmac"]:
+                    return json_rpc_error(req_id, -32602, f"Unauthorized network command: {cmd}")
+                
+                clean_args = []
+                import re
+                for arg in cmd_args:
+                    if re.match(r'^[a-zA-Z0-9\-_\.\/\\:\s\?\*]+$', arg):
+                        clean_args.append(arg)
+                    else:
+                        return json_rpc_error(req_id, -32602, f"Invalid characters in argument: {arg}")
+                
+                cmd_list = [cmd] + clean_args
+                res = exec_cmd(cmd_list)
+                return json_rpc_success(req_id, res)
+
+            elif tool_name == "run_cloudflare_command":
+                cmd = args.get("command")
+                cmd_args = args.get("args", [])
+                sub_proj = args.get("sub_project", "root")
+                
+                if cmd not in ["wrangler", "cloudflared"]:
+                    return json_rpc_error(req_id, -32602, f"Unauthorized cloudflare command: {cmd}")
+                
+                proj_dir = REPO_ROOT
+                if sub_proj == "mcp-server":
+                    proj_dir = os.path.join(REPO_ROOT, "mcp-server")
+                elif sub_proj == "cloudflare-api":
+                    proj_dir = os.path.join(REPO_ROOT, "cloudflare-api")
+                elif sub_proj == "poker-daemon-worker":
+                    proj_dir = os.path.join(REPO_ROOT, "poker-daemon", "worker")
+                
+                if not os.path.isdir(proj_dir):
+                    return json_rpc_error(req_id, -32602, f"Directory does not exist: {proj_dir}")
+                
+                clean_args = []
+                import re
+                for arg in cmd_args:
+                    if re.match(r'^[a-zA-Z0-9\-_\.\/\\:\s=@\"\?\*]+$', arg):
+                        clean_args.append(arg)
+                    else:
+                        return json_rpc_error(req_id, -32602, f"Invalid characters in cloudflare argument: {arg}")
+                
+                if cmd == "wrangler":
+                    cmd_list = ["npx", "wrangler"] + clean_args
+                else:
+                    cmd_list = [cmd] + clean_args
+                
+                res = exec_cmd(cmd_list, cwd=proj_dir)
+                return json_rpc_success(req_id, res)
 
             else:
                 return json_rpc_error(req_id, -32601, f"Method not found: {tool_name}")

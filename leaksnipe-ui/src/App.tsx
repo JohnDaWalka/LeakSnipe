@@ -27,7 +27,7 @@ import { HandDetailPanel, HandReplayerModal } from "./components/HandDetail";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { StatsPanel } from "./components/StatsPanel";
 import { OrganizePanel } from "./components/OrganizePanel";
-import { resolveHudBackend, syncLiveHud } from "./lib/hudManager";
+import { isLiveHudRunning, resolveHudBackend, stopLiveHud, syncLiveHud } from "./lib/hudManager";
 import "./App.css";
 
 const TABS: { id: TabId; label: string; hint: string }[] = [
@@ -81,6 +81,8 @@ function App() {
   const [detailError, setDetailError] = useState<string | null>(null);
   const [replayerLoadingId, setReplayerLoadingId] = useState<string | null>(null);
   const [hudError, setHudError] = useState<string | null>(null);
+  const [tauriHudRunning, setTauriHudRunning] = useState(false);
+  const [tauriHudStopping, setTauriHudStopping] = useState(false);
   const [sidecarOnline, setSidecarOnline] = useState<boolean | null>(null);
   const [sidecarStarting, setSidecarStarting] = useState(false);
   const [sidecarStatus, setSidecarStatus] = useState<SidecarStatus | null>(null);
@@ -373,8 +375,36 @@ function App() {
       .then(() => setHudError(null))
       .catch((err) => {
         setHudError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (backend === "tauri") void isLiveHudRunning().then(setTauriHudRunning);
       });
   }, [settings?.live_hud_enabled, settings?.live_hud_backend]);
+
+  const stopTauriHudNow = async () => {
+    setTauriHudStopping(true);
+    try {
+      await stopLiveHud();
+      setTauriHudRunning(false);
+      setHudError(null);
+    } catch (err) {
+      setHudError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTauriHudStopping(false);
+    }
+  };
+
+  // The overlay can be (re)started by paths other than the effect above —
+  // e.g. saving Settings for something unrelated re-syncs it — so polling
+  // actual process state is the only way the button/banner stays accurate
+  // instead of going stale after the first stop/start.
+  useEffect(() => {
+    if (!settings || resolveHudBackend(settings) !== "tauri") return;
+    const poll = () => void isLiveHudRunning().then(setTauriHudRunning);
+    poll();
+    const timer = window.setInterval(poll, 4000);
+    return () => window.clearInterval(timer);
+  }, [settings?.live_hud_backend]);
 
   useEffect(() => {
     let cancelled = false;
@@ -693,7 +723,20 @@ function App() {
           ) : null}
           {settings?.live_hud_enabled && !hudError ? (
             resolveHudBackend(settings) === "tauri" ? (
-              <div className="success-banner">Tauri Live HUD overlay is active (experimental)</div>
+              tauriHudRunning ? (
+                <div className="success-banner">
+                  Tauri Live HUD overlay is active (experimental)
+                  <button
+                    type="button"
+                    className="secondary-btn"
+                    style={{ marginLeft: "0.75rem" }}
+                    disabled={tauriHudStopping}
+                    onClick={() => void stopTauriHudNow()}
+                  >
+                    {tauriHudStopping ? "Turning off…" : "Turn HUD off"}
+                  </button>
+                </div>
+              ) : null
             ) : (
               <div className="success-banner">
                 Live HUD enabled — open Settings and click Launch Python Live HUD

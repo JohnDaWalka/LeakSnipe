@@ -31,14 +31,6 @@ except Exception as e:
 
 mcp = FastMCP(
     name="LeakSnipe",
-    instructions=(
-        "LeakSnipe poker hand database (sqlite). Default DB: poker_hands. "
-        "Heroes tracked: Gboss101/gboss101 and jdwalka/Johndawalka. "
-        "Find hero hands by joining hands with players where is_hero=1 and "
-        "name matches (use lower(name) LIKE '%gboss101%' or '%jdwalka%'). "
-        "Tools: list_databases, list_tables, describe_table, read_query, "
-        "database_overview. Only SELECT/WITH allowed."
-    ),
 )
 
 
@@ -150,6 +142,32 @@ def serialize_hand(hand: Hand, settings: dict) -> dict:
             for w in getattr(hand, "winners", [])
         ],
         "raw_text": hand.raw_text
+    }
+
+def _safe_decode(b):
+    if not b:
+        return ""
+    for encoding in ['utf-8', 'cp1252', 'cp850']:
+        try:
+            return b.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return b.decode('utf-8', errors='replace')
+
+def _exec_cmd(cmd_list, cwd=None):
+    import subprocess
+    cmd_str = " ".join(cmd_list)
+    res = subprocess.run(
+        cmd_str,
+        cwd=cwd,
+        shell=True,
+        capture_output=True,
+        timeout=30
+    )
+    return {
+        "stdout": _safe_decode(res.stdout),
+        "stderr": _safe_decode(res.stderr),
+        "exit_code": res.returncode
     }
 
 def build_cards_sql(cards: str) -> tuple[str, list]:
@@ -548,6 +566,202 @@ def search_hands(
     lim = limit if limit is not None else parsed_limit
     sql = f"SELECT * FROM hands{where_str} ORDER BY date DESC LIMIT ? OFFSET ?"
     return query_and_serialize_hands(db, settings, sql, sql_params + [lim, offset])
+
+
+@mcp.tool()
+def get_sessions_winrate(
+    site: Optional[str] = None,
+    gap_minutes: int = 30,
+    limit: int = 10,
+    database: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Calculate poker sessions dynamically based on gap minutes and return session winrate, profit, and duration.
+
+    Args:
+        site: Filter by site (e.g. 'CoinPoker', 'BetACR').
+        gap_minutes: Minutes gap between hands to define a new session (default 30).
+        limit: Max sessions to return (default 10).
+        database: Optional database name (default: poker_hands).
+    """
+    from collections import defaultdict
+    from datetime import datetime
+    settings = load_settings()
+    db = HandDatabase(str(_resolve_db(database)))
+    
+    sql = "SELECT hand_id, date, site, hero_won, is_tournament, hero_position FROM hands"
+    params = []
+    where_clauses = []
+    if site:
+        where_clauses.append("site = ?")
+        params.append(site)
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses)
+    sql += " ORDER BY date ASC"
+    
+    with db.lock:
+        conn = db._connect()
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+            
+    if not rows:
+        return []
+        
+    hands_by_site = defaultdict(list)
+    for r in rows:
+        hands_by_site[r["site"]].append(r)
+        
+    sessions = []
+    gap_seconds = gap_minutes * 60
+    
+    for current_site, site_hands in hands_by_site.items():
+        if not site_hands:
+            continue
+            
+        current_session = []
+        last_time = None
+        
+        for h in site_hands:
+            h_date_str = h["date"]
+            if not h_date_str:
+                continue
+            try:
+                h_date = datetime.fromisoformat(h_date_str)
+            except Exception:
+                continue
+                
+            if last_time is not None:
+                diff = (h_date - last_time).total_seconds()
+                if diff > gap_seconds:
+                    sessions.append((current_site, current_session))
+                    current_session = []
+            
+            current_session.append({
+                "hand_id": h["hand_id"],
+                "date": h_date,
+                "hero_won": h["hero_won"] or 0.0,
+                "is_tournament": bool(h["is_tournament"]),
+                "position": h["hero_position"]
+            })
+            last_time = h_date
+            
+        if current_session:
+            sessions.append((current_site, current_session))
+            
+    summary_sessions = []
+    for idx, (sess_site, sess) in enumerate(sessions):
+        if not sess:
+            continue
+        first_hand = sess[0]
+        last_hand = sess[-1]
+        
+        hand_count = len(sess)
+        total_won = sum(h["hero_won"] for h in sess)
+        won_hands = sum(1 for h in sess if h["hero_won"] > 0)
+        lost_hands = sum(1 for h in sess if h["hero_won"] < 0)
+        
+        duration = (last_hand["date"] - first_hand["date"]).total_seconds()
+        duration_minutes = round(duration / 60, 1)
+        
+        winrate_pct = round((won_hands / hand_count) * 100, 1) if hand_count > 0 else 0.0
+        
+        summary_sessions.append({
+            "session_index": idx + 1,
+            "site": sess_site,
+            "start_time": first_hand["date"].isoformat(),
+            "end_time": last_hand["date"].isoformat(),
+            "hand_count": hand_count,
+            "net_profit": round(total_won, 2),
+            "won_hands": won_hands,
+            "lost_hands": lost_hands,
+            "winrate_pct": winrate_pct,
+            "duration_minutes": duration_minutes,
+            "hands_per_hour": round(hand_count / (duration / 3600), 1) if duration > 60 else hand_count
+        })
+        
+    summary_sessions.sort(key=lambda s: s["start_time"], reverse=True)
+    return summary_sessions[:limit]
+
+
+@mcp.tool()
+def run_network_command(
+    command: str,
+    args: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Execute network diagnostics and tools (ipconfig, ping, tracert, nslookup, netstat, arp, route, getmac).
+
+    Args:
+        command: Network tool to run. Enum: 'ipconfig', 'ping', 'tracert', 'nslookup', 'netstat', 'arp', 'route', 'getmac'.
+        args: List of arguments to pass to the command.
+    """
+    if command not in ["ipconfig", "ping", "tracert", "nslookup", "netstat", "arp", "route", "getmac"]:
+        raise ValueError(f"Unauthorized network command: {command}")
+    
+    cmd_args = args or []
+    clean_args = []
+    import re
+    for arg in cmd_args:
+        if re.match(r'^[a-zA-Z0-9\-_\.\/\\:\s\?\*]+$', arg):
+            clean_args.append(arg)
+        else:
+            raise ValueError(f"Invalid characters in argument: {arg}")
+            
+    cmd_list = [command] + clean_args
+    try:
+        return _exec_cmd(cmd_list)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def run_cloudflare_command(
+    command: str,
+    args: List[str],
+    sub_project: str = "root"
+) -> Dict[str, Any]:
+    """Execute Cloudflare wrangler or cloudflared commands to inspect configuration, tunnels, D1, or R2.
+
+    Args:
+        command: Command to execute. Enum: 'wrangler', 'cloudflared'.
+        args: Arguments to pass (e.g. ['tunnel', 'list'] or ['whoami']).
+        sub_project: Working directory context to run wrangler command. Enum: 'root', 'mcp-server', 'cloudflare-api', 'poker-daemon-worker'.
+    """
+    if command not in ["wrangler", "cloudflared"]:
+        raise ValueError(f"Unauthorized cloudflare command: {command}")
+        
+    if sub_project not in ["root", "mcp-server", "cloudflare-api", "poker-daemon-worker"]:
+        raise ValueError(f"Unauthorized sub_project: {sub_project}")
+        
+    proj_dir = REPO_ROOT
+    if sub_project == "mcp-server":
+        proj_dir = REPO_ROOT / "mcp-server"
+    elif sub_project == "cloudflare-api":
+        proj_dir = REPO_ROOT / "cloudflare-api"
+    elif sub_project == "poker-daemon-worker":
+        proj_dir = REPO_ROOT / "poker-daemon" / "worker"
+        
+    if not proj_dir.is_dir():
+        raise ValueError(f"Directory does not exist: {proj_dir}")
+        
+    clean_args = []
+    import re
+    for arg in args:
+        if re.match(r'^[a-zA-Z0-9\-_\.\/\\:\s=@\"\?\*]+$', arg):
+            clean_args.append(arg)
+        else:
+            raise ValueError(f"Invalid characters in cloudflare argument: {arg}")
+            
+    if command == "wrangler":
+        cmd_list = ["npx", "wrangler"] + clean_args
+    else:
+        cmd_list = [command] + clean_args
+        
+    try:
+        return _exec_cmd(cmd_list, cwd=str(proj_dir))
+    except Exception as e:
+        return {"error": str(e)}
 
 
 class _GrokHeaderMiddleware:

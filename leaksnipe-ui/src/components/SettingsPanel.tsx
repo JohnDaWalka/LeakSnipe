@@ -12,9 +12,11 @@ import {
 } from "../lib/api";
 import {
   diagnoseLiveHud,
+  isLiveHudRunning,
   isPythonHudRunning,
   launchPythonLiveHud,
   resolveHudBackend,
+  stopLiveHud,
   stopPythonLiveHud,
   testLiveHud,
   toggleHudLayoutMode,
@@ -69,6 +71,8 @@ export function SettingsPanel({ settings, folders, onSaved }: SettingsPanelProps
   const [pythonHudLaunching, setPythonHudLaunching] = useState(false);
   const [pythonHudStopping, setPythonHudStopping] = useState(false);
   const [pythonHudRunning, setPythonHudRunning] = useState(false);
+  const [tauriHudStopping, setTauriHudStopping] = useState(false);
+  const [tauriHudRunning, setTauriHudRunning] = useState(false);
   const [refreshingAi, setRefreshingAi] = useState(false);
 
   const loadAiStatus = useCallback(async (reloadKeys = false) => {
@@ -199,6 +203,22 @@ export function SettingsPanel({ settings, folders, onSaved }: SettingsPanelProps
     }
   };
 
+  const stopTauriHud = async () => {
+    setTauriHudStopping(true);
+    setHudDiagError(null);
+    try {
+      await stopLiveHud();
+      setTauriHudRunning(false);
+      setMessage("Tauri Live HUD overlay stopped.");
+      window.setTimeout(() => setMessage(null), 4000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setHudDiagError(`Could not stop Tauri overlay: ${msg}`);
+    } finally {
+      setTauriHudStopping(false);
+    }
+  };
+
   const resetHudSeatPositions = async () => {
     if (!draft) return;
     setSaving(true);
@@ -231,6 +251,17 @@ export function SettingsPanel({ settings, folders, onSaved }: SettingsPanelProps
 
   const hudBackend = resolveHudBackend(draft);
   const useTauriHud = hudBackend === "tauri";
+
+  // Polled (not just dependency-triggered) so the button reflects reality
+  // even when the overlay is started/stopped from elsewhere — e.g. the
+  // main-window banner button, or a Settings save re-syncing it.
+  useEffect(() => {
+    if (!useTauriHud) return;
+    const poll = () => void isLiveHudRunning().then(setTauriHudRunning).catch(() => setTauriHudRunning(false));
+    poll();
+    const timer = window.setInterval(poll, 4000);
+    return () => window.clearInterval(timer);
+  }, [useTauriHud]);
 
   if (!draft) {
     return <div className="placeholder-card">Loading settings…</div>;
@@ -588,6 +619,16 @@ export function SettingsPanel({ settings, folders, onSaved }: SettingsPanelProps
                 disabled={hudTesting}
               >
                 {hudTesting ? "Testing HUD…" : "Test Tauri overlay"}
+              </button>
+            ) : null}
+            {useTauriHud ? (
+              <button
+                type="button"
+                className="secondary-btn"
+                onClick={() => void stopTauriHud()}
+                disabled={tauriHudStopping || !tauriHudRunning}
+              >
+                {tauriHudStopping ? "Stopping…" : "Stop Tauri overlay"}
               </button>
             ) : null}
             {useTauriHud ? (

@@ -31,6 +31,14 @@
     {
       "path": "C:\\ACR Poker\\TournamentSummary\\GBOSS101",
       "site": "BetACR"
+    },
+    {
+      "path": "C:\\Users\\Giuli\\AppData\\Local\\Temp\\updapp-play\\handhistory",
+      "site": "CoinPoker"
+    },
+    {
+      "path": "C:\\Users\\Giuli\\OneDrive\\PokerHandHistories",
+      "site": "CoinPoker"
     }
   ],
   "auto_refresh": true,
@@ -115,8 +123,8 @@
       "y": 0.7798148148148148
     },
     "6:5": {
-      "x": 0.6640028188865399,
-      "y": 0.2662962962962963
+      "x": 0.5451138113181804,
+      "y": 0.8454053827153272
     },
     "6:2": {
       "x": 0.11095137420718815,
