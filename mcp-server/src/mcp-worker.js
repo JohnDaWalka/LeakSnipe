@@ -2097,6 +2097,89 @@ server.registerTool('search_hands', {
   return await resp.json();
 });
 
+server.registerTool('get_sessions_winrate', {
+  description: 'Calculate poker sessions dynamically based on gap minutes and return session winrate, profit, and duration.',
+  properties: {
+    site: { type: 'string', description: 'Filter by poker site (e.g. "CoinPoker", "BetACR")' },
+    gap_minutes: { type: 'number', description: 'Minutes gap between hands to define a new session (default 30)', default: 30 },
+    limit: { type: 'number', description: 'Max sessions to return (default 10)', default: 10 }
+  },
+  required: []
+}, async (args, env) => {
+  const resp = await fetch('https://db.leaksnipe.win/mcp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: {
+        name: 'get_sessions_winrate',
+        arguments: args
+      }
+    })
+  });
+  if (!resp.ok) throw new Error('Local MCP call failed: ' + resp.status + ' ' + await resp.text());
+  const json = await resp.json();
+  if (json.error) throw new Error(json.error.message);
+  return json.result.content;
+});
+
+server.registerTool('run_network_command', {
+  description: 'Execute network diagnostics and tools (ipconfig, ping, tracert, nslookup, netstat, arp, route, getmac) on the local machine.',
+  properties: {
+    command: { type: 'string', description: 'Network tool to run (ipconfig, ping, tracert, nslookup, netstat, arp, route, getmac)' },
+    args: { type: 'array', items: { type: 'string' }, description: 'List of arguments to pass to the command' }
+  },
+  required: ['command']
+}, async (args, env) => {
+  const resp = await fetch('https://db.leaksnipe.win/mcp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: {
+        name: 'run_network_command',
+        arguments: args
+      }
+    })
+  });
+  if (!resp.ok) throw new Error('Local MCP call failed: ' + resp.status + ' ' + await resp.text());
+  const json = await resp.json();
+  if (json.error) throw new Error(json.error.message);
+  return json.result.content;
+});
+
+server.registerTool('run_cloudflare_command', {
+  description: 'Execute Cloudflare wrangler or cloudflared commands on the local machine to inspect configuration, tunnels, D1, or R2.',
+  properties: {
+    command: { type: 'string', description: 'Command to execute (wrangler, cloudflared)' },
+    args: { type: 'array', items: { type: 'string' }, description: 'Arguments to pass' },
+    sub_project: { type: 'string', description: 'Working directory context to run wrangler command (root, mcp-server, cloudflare-api, poker-daemon-worker)', default: 'root' }
+  },
+  required: ['command', 'args']
+}, async (args, env) => {
+  const resp = await fetch('https://db.leaksnipe.win/mcp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: {
+        name: 'run_cloudflare_command',
+        arguments: args
+      }
+    })
+  });
+  if (!resp.ok) throw new Error('Local MCP call failed: ' + resp.status + ' ' + await resp.text());
+  const json = await resp.json();
+  if (json.error) throw new Error(json.error.message);
+  return json.result.content;
+});
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
