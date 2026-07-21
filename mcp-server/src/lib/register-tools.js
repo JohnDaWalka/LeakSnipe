@@ -34,6 +34,7 @@ import {
   d1Run,
   d1First,
   COACHING_SCHEMA,
+  getOrComputeAnalytics,
   queryHands,
   proxyLocalMcp,
   HAND_HISTORY_BUCKETS,
@@ -384,20 +385,23 @@ export function registerAllTools(server) {
       const f = pickFilterArgs(args || {});
       const { where, params } = buildHandWhere(f, { tableAlias: 'h' });
       where.push("h.hero_position IS NOT NULL AND h.hero_position != '' AND h.hero_position != '?'");
+      // GROUP BY is_tournament even when the caller doesn't filter it — cash
+      // dollars and tournament chips must never sum into one total_profit.
       const sql = `
         SELECT
           h.hero_position AS position,
+          CASE WHEN h.is_tournament = 1 THEN 'tournament_chips' ELSE 'cash_usd' END AS unit,
           COUNT(*) AS total_hands,
           SUM(CASE WHEN h.hero_won > 0 THEN 1 ELSE 0 END) AS hands_won,
           SUM(h.hero_won) AS total_profit
         FROM hands h
         WHERE ${where.join(' AND ')}
-        GROUP BY h.hero_position
-        ORDER BY total_profit DESC
+        GROUP BY h.hero_position, unit
+        ORDER BY unit, total_profit DESC
       `;
       const raw = await dbQuery(env, sql, params);
       return okStats(raw.results || [], {
-        note: 'total_profit is in site/tournament chip units, not always USD.',
+        note: 'cash_usd rows are dollars; tournament_chips rows are chips — never sum across units.',
       });
     }
   );
@@ -820,6 +824,26 @@ export function registerAllTools(server) {
   // control); ported here so a repo deploy no longer removes them. Names,
   // schemas, and response shapes match the deployed versions exactly.
 
+  // Pragmas that only introspect — never accepted in assignment form.
+  const D1_SAFE_PRAGMAS = new Set([
+    'table_info',
+    'table_xinfo',
+    'table_list',
+    'index_list',
+    'index_info',
+    'index_xinfo',
+    'foreign_key_list',
+    'database_list',
+    'collation_list',
+    'function_list',
+    'pragma_list',
+    'compile_options',
+    'freelist_count',
+    'page_count',
+    'user_version',
+    'application_id',
+  ]);
+
   server.registerTool(
     'list_full_schemas',
     {
@@ -898,6 +922,18 @@ export function registerAllTools(server) {
       const lower = sql.toLowerCase();
       if (!(lower.startsWith('select') || lower.startsWith('with') || lower.startsWith('pragma'))) {
         throw new Error('Only SELECT/WITH/PRAGMA allowed on D1');
+      }
+      if (lower.startsWith('pragma')) {
+        // PRAGMA is not uniformly read-only: writable_schema, journal_mode,
+        // foreign_keys etc. mutate state, and even readable pragmas accept an
+        // assignment form (PRAGMA user_version = 5). Allow only whitelisted
+        // introspection pragmas in bare or call form.
+        const m = lower.match(/^pragma\s+(?:\w+\.)?(\w+)\s*(\(|$)/);
+        if (!m || !D1_SAFE_PRAGMAS.has(m[1])) {
+          throw new Error(
+            `Only read-only introspection pragmas are allowed: ${[...D1_SAFE_PRAGMAS].join(', ')}`
+          );
+        }
       }
       if (/;/.test(sql.replace(/;+\s*$/, ''))) throw new Error('Multiple statements not allowed');
       const stmt = requireD1(env).prepare(sql);
@@ -989,8 +1025,12 @@ export function registerAllTools(server) {
       let sql = 'SELECT id, hero, kind, user_text, assistant_text, provider, created_at FROM coach_memory';
       const binds = [];
       if (hero) {
-        sql += ' WHERE lower(hero) LIKE lower(?)';
-        binds.push(`%${hero}%`);
+        // Substring LIKE doesn't resolve aliases — "jdwalka" is not a
+        // substring of "JohnDaWalka", so filtering by one alias silently
+        // missed every row stored under another. Match the full alias group.
+        const aliases = expandPlayerAliases(hero);
+        sql += ` WHERE lower(hero) IN (${aliases.map(() => 'lower(?)').join(',')})`;
+        binds.push(...aliases);
       }
       sql += ' ORDER BY created_at DESC LIMIT ?';
       binds.push(limit);
@@ -1031,6 +1071,325 @@ export function registerAllTools(server) {
         );
       } catch (_) {}
       return { counts, unit_split, note: 'is_tournament=1 nets are chips; is_tournament=0 nets are USD' };
+    }
+  );
+
+  // ========== CACHED ANALYTICS (desktop-tunnel-backed, KV-cached hourly) ==========
+  // Ported from the live worker (existed outside version control). Two of
+  // these 500'd on every call: positionStats/threeBetStats/vpip-by-position
+  // referenced `p.position`, but position lives on hands.hero_position, not
+  // players — there is no players.position column. Fixed here, plus two bugs
+  // that would otherwise still be present after the crash was fixed:
+  // `actions.street` is stored capitalized ('Preflop'), so the original
+  // lowercase 'preflop' comparison never matched anything (silent 0%, not an
+  // error); and 'showdown' is not a street value at all — no hand ever has
+  // one — so showdown detection is rewritten using the same convention
+  // analysis.py's LeakEngine uses: a non-fold River action for that player.
+
+  server.registerTool(
+    'get_player_winrate_cached',
+    {
+      description: 'Get player win rate with KV caching (last N days). Computed once per hour.',
+      properties: {
+        playerName: { type: 'string', description: 'Player name to check (exact match)' },
+        days: { type: 'number', description: 'Number of days to look back', default: 30 },
+      },
+      required: ['playerName'],
+    },
+    async (args, env) => {
+      const { playerName, days = 30 } = args;
+      return getOrComputeAnalytics(env, `winrate:${playerName}:${days}`, async () => {
+        const result = await dbQuery(
+          env,
+          `SELECT
+            SUM(CASE WHEN h.hero_won > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS win_rate,
+            COUNT(*) AS hands_played,
+            SUM(h.hero_won) AS net_profit,
+            AVG(h.hero_won) AS avg_win_per_hand
+          FROM hands h
+          JOIN players p ON p.hand_id = h.hand_id AND p.is_hero = 1
+          WHERE p.name = ? AND h.date >= datetime('now', ?)`,
+          [playerName, `-${Number(days) || 30} days`]
+        );
+        return result.results?.[0] || {};
+      });
+    }
+  );
+
+  server.registerTool(
+    'get_player_vpip_pfr_by_position_cached',
+    {
+      description: 'Get VPIP/PFR by position for a player with KV caching. Computed once per hour.',
+      properties: {
+        playerName: { type: 'string', description: 'Player name to analyze (exact match)' },
+        days: { type: 'number', description: 'Number of days to look back', default: 30 },
+      },
+      required: ['playerName'],
+    },
+    async (args, env) => {
+      const { playerName, days = 30 } = args;
+      return getOrComputeAnalytics(env, `vpip_pfr_position:${playerName}:${days}`, async () => {
+        const result = await dbQuery(
+          env,
+          `SELECT
+            h.hero_position AS position,
+            COUNT(*) AS hands,
+            SUM(CASE WHEN EXISTS (
+              SELECT 1 FROM actions a WHERE a.hand_id = h.hand_id AND a.street = 'Preflop'
+                AND a.player = p.name AND a.action IN ('call','bet','raise')
+            ) THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS vpip_pct,
+            SUM(CASE WHEN EXISTS (
+              SELECT 1 FROM actions a WHERE a.hand_id = h.hand_id AND a.street = 'Preflop'
+                AND a.player = p.name AND a.action IN ('bet','raise')
+            ) THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS pfr_pct
+          FROM hands h
+          JOIN players p ON p.hand_id = h.hand_id AND p.is_hero = 1
+          WHERE p.name = ? AND h.date >= datetime('now', ?) AND h.hero_position IS NOT NULL
+            AND h.hero_position != '' AND h.hero_position != '?'
+          GROUP BY h.hero_position
+          ORDER BY CASE h.hero_position
+            WHEN 'UTG' THEN 1 WHEN 'UTG+1' THEN 2 WHEN 'UTG+2' THEN 3 WHEN 'MP' THEN 4
+            WHEN 'HJ' THEN 5 WHEN 'CO' THEN 6 WHEN 'BTN' THEN 7 WHEN 'SB' THEN 8
+            WHEN 'BB' THEN 9 ELSE 10 END`,
+          [playerName, `-${Number(days) || 30} days`]
+        );
+        return { position_stats: result.results || [] };
+      });
+    }
+  );
+
+  server.registerTool(
+    'get_session_stats_cached',
+    {
+      description: 'Get session-based statistics (win rate, streaks, best/worst sessions) with KV caching.',
+      properties: {
+        playerName: { type: 'string', description: 'Player name to analyze (exact match)' },
+        days: { type: 'number', description: 'Number of days to look back', default: 30 },
+        sessionGapHours: { type: 'number', description: 'Hours between hands to define session break', default: 2 },
+      },
+      required: ['playerName'],
+    },
+    async (args, env) => {
+      const { playerName, days = 30, sessionGapHours = 2 } = args;
+      return getOrComputeAnalytics(env, `session_stats:${playerName}:${days}:${sessionGapHours}`, async () => {
+        const handsResult = await dbQuery(
+          env,
+          `SELECT h.hand_id, h.date, h.hero_won, h.is_tournament
+          FROM hands h
+          JOIN players p ON p.hand_id = h.hand_id AND p.is_hero = 1 AND p.name = ?
+          WHERE h.date >= datetime('now', ?)
+          ORDER BY h.date ASC`,
+          [playerName, `-${Number(days) || 30} days`]
+        );
+        const hands = handsResult.results || [];
+        if (hands.length === 0) {
+          return {
+            sessions: [],
+            summary: {
+              total_sessions: 0, total_hands: 0, total_profit: 0, avg_session_profit: 0,
+              best_session: null, worst_session: null, current_streak: 0,
+              max_win_streak: 0, max_loss_streak: 0,
+            },
+          };
+        }
+        const sessions = [];
+        let current = { hands: [hands[0]], startTime: new Date(hands[0].date), endTime: new Date(hands[0].date) };
+        const gapMs = (Number(sessionGapHours) || 2) * 60 * 60 * 1000;
+        for (let i = 1; i < hands.length; i++) {
+          const t = new Date(hands[i].date);
+          const prev = new Date(hands[i - 1].date);
+          if (t - prev <= gapMs) {
+            current.hands.push(hands[i]);
+            current.endTime = t;
+          } else {
+            sessions.push(current);
+            current = { hands: [hands[i]], startTime: t, endTime: t };
+          }
+        }
+        sessions.push(current);
+        const sessionStats = sessions.map((s) => {
+          const n = s.hands.length;
+          const profit = s.hands.reduce((sum, h) => sum + h.hero_won, 0);
+          const winRate = n > 0 ? (s.hands.filter((h) => h.hero_won > 0).length / n) * 100 : 0;
+          return {
+            sessionId: s.hands[0].hand_id,
+            startTime: s.startTime.toISOString(),
+            endTime: s.endTime.toISOString(),
+            handCount: n,
+            totalProfit: profit,
+            winRate: Number(winRate.toFixed(2)),
+            avgProfitPerHand: n > 0 ? Number((profit / n).toFixed(2)) : 0,
+          };
+        });
+        const totalHands = hands.length;
+        const totalProfit = hands.reduce((sum, h) => sum + h.hero_won, 0);
+        const overallWinRate = totalHands > 0 ? (hands.filter((h) => h.hero_won > 0).length / totalHands) * 100 : 0;
+        let currentStreak = 0, maxWinStreak = 0, maxLossStreak = 0, winStreak = 0, lossStreak = 0;
+        for (const h of hands) {
+          if (h.hero_won > 0) { winStreak++; lossStreak = 0; maxWinStreak = Math.max(maxWinStreak, winStreak); }
+          else if (h.hero_won < 0) { lossStreak++; winStreak = 0; maxLossStreak = Math.max(maxLossStreak, lossStreak); }
+          else { winStreak = 0; lossStreak = 0; }
+        }
+        const last = hands[hands.length - 1];
+        currentStreak = last.hero_won > 0 ? winStreak : last.hero_won < 0 ? -lossStreak : 0;
+        const bestSession = sessionStats.length
+          ? sessionStats.reduce((a, b) => (a.totalProfit > b.totalProfit ? a : b))
+          : null;
+        const worstSession = sessionStats.length
+          ? sessionStats.reduce((a, b) => (a.totalProfit < b.totalProfit ? a : b))
+          : null;
+        return {
+          sessions: sessionStats,
+          summary: {
+            total_sessions: sessions.length,
+            total_hands: totalHands,
+            total_profit_chips: totalProfit,
+            avg_session_profit_chips: sessionStats.length
+              ? Number((sessionStats.reduce((sum, s) => sum + s.totalProfit, 0) / sessionStats.length).toFixed(2))
+              : 0,
+            overall_win_rate: Number(overallWinRate.toFixed(2)),
+            best_session: bestSession,
+            worst_session: worstSession,
+            current_streak: currentStreak,
+            max_win_streak: maxWinStreak,
+            max_loss_streak: maxLossStreak,
+            note: 'profit fields are chip/tournament units unless every hand in range is cash — check is_tournament per hand for mixed ranges.',
+          },
+        };
+      });
+    }
+  );
+
+  server.registerTool(
+    'get_leak_report_cached',
+    {
+      description: 'Get a comprehensive leak report for a player with KV caching. Computed once per hour.',
+      properties: {
+        playerName: { type: 'string', description: 'Player name to analyze (exact match)' },
+        days: { type: 'number', description: 'Number of days to look back', default: 30 },
+      },
+      required: ['playerName'],
+    },
+    async (args, env) => {
+      const { playerName, days = 30 } = args;
+      return getOrComputeAnalytics(env, `leak_report:${playerName}:${days}`, async () => {
+        const range = `-${Number(days) || 30} days`;
+        const basicStats = await dbQuery(
+          env,
+          `SELECT COUNT(*) AS total_hands,
+            SUM(CASE WHEN h.hero_won > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS overall_winrate,
+            AVG(h.hero_won) AS avg_profit_per_hand,
+            SUM(h.hero_won) AS total_profit
+          FROM hands h
+          JOIN players p ON p.hand_id = h.hand_id AND p.is_hero = 1 AND p.name = ?
+          WHERE h.date >= datetime('now', ?)`,
+          [playerName, range]
+        );
+        const positionStats = await dbQuery(
+          env,
+          `SELECT
+            h.hero_position AS position,
+            COUNT(*) AS hands,
+            SUM(CASE WHEN EXISTS (
+              SELECT 1 FROM actions a WHERE a.hand_id = h.hand_id AND a.street = 'Preflop'
+                AND a.player = p.name AND a.action IN ('call','bet','raise')
+            ) THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS vpip_pct,
+            SUM(CASE WHEN EXISTS (
+              SELECT 1 FROM actions a WHERE a.hand_id = h.hand_id AND a.street = 'Preflop'
+                AND a.player = p.name AND a.action IN ('bet','raise')
+            ) THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS pfr_pct
+          FROM hands h
+          JOIN players p ON p.hand_id = h.hand_id AND p.is_hero = 1 AND p.name = ?
+          WHERE h.date >= datetime('now', ?) AND h.hero_position IS NOT NULL
+            AND h.hero_position != '' AND h.hero_position != '?'
+          GROUP BY h.hero_position`,
+          [playerName, range]
+        );
+        const threeBetStats = await dbQuery(
+          env,
+          `SELECT
+            COUNT(*) AS total_hands_preflop,
+            SUM(CASE WHEN (
+              SELECT COUNT(*) FROM actions a2 WHERE a2.hand_id = h.hand_id AND a2.street = 'Preflop'
+                AND a2.action IN ('bet','raise')
+            ) >= 2 THEN 1 ELSE 0 END) AS times_3bet_or_more
+          FROM hands h
+          JOIN players p ON p.hand_id = h.hand_id AND p.is_hero = 1 AND p.name = ?
+          WHERE h.date >= datetime('now', ?)
+            AND EXISTS (SELECT 1 FROM actions a1 WHERE a1.hand_id = h.hand_id AND a1.street = 'Preflop' AND a1.player = p.name)`,
+          [playerName, range]
+        );
+        // "Went to showdown" = a non-fold action on the River — same
+        // convention analysis.py's LeakEngine uses (there is no 'showdown'
+        // street; that comparison in the original never matched anything).
+        const showdownStats = await dbQuery(
+          env,
+          `SELECT
+            COUNT(*) AS hands_showdown,
+            SUM(CASE WHEN h.hero_won > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS showdown_winrate
+          FROM hands h
+          JOIN players p ON p.hand_id = h.hand_id AND p.is_hero = 1 AND p.name = ?
+          WHERE h.date >= datetime('now', ?)
+            AND EXISTS (
+              SELECT 1 FROM actions a WHERE a.hand_id = h.hand_id AND a.street = 'River'
+                AND a.player = p.name AND a.action != 'fold'
+            )`,
+          [playerName, range]
+        );
+
+        const basic = basicStats.results?.[0] || {};
+        const positions = positionStats.results || [];
+        const threeBet = threeBetStats.results?.[0] || {};
+        const showdown = showdownStats.results?.[0] || {};
+        const leaks = [];
+        const RANGES = {
+          UTG: [8, 18], 'UTG+1': [8, 18], 'UTG+2': [9, 20], MP: [10, 22], HJ: [11, 24],
+          CO: [12, 26], BTN: [15, 30], SB: [12, 28], BB: [10, 25],
+        };
+        positions.forEach((pos) => {
+          const vpip = parseFloat(pos.vpip_pct) || 0;
+          const pfr = parseFloat(pos.pfr_pct) || 0;
+          const [minVPIP, maxVPIP] = RANGES[pos.position] || [10, 30];
+          if (vpip > maxVPIP) {
+            leaks.push({ type: 'VPIP_TOO_HIGH', position: pos.position, current: vpip.toFixed(1), recommended: maxVPIP, severity: 'HIGH', description: `Playing too many hands from ${pos.position} (VPIP ${vpip}% > ${maxVPIP}% max)` });
+          } else if (vpip < minVPIP) {
+            leaks.push({ type: 'VPIP_TOO_LOW', position: pos.position, current: vpip.toFixed(1), recommended: minVPIP, severity: 'MEDIUM', description: `Playing too few hands from ${pos.position} (VPIP ${vpip}% < ${minVPIP}% min)` });
+          }
+          if (vpip > 0) {
+            const aggressionPct = (pfr / vpip) * 100;
+            if (aggressionPct < 40) {
+              leaks.push({ type: 'NOT_AGGRESSIVE_ENOUGH', position: pos.position, current: aggressionPct.toFixed(1), recommended: '60-80', severity: 'MEDIUM', description: `Not aggressive enough from ${pos.position} (PFR/VPIP ratio ${aggressionPct.toFixed(1)}% < 40%)` });
+            } else if (aggressionPct > 90) {
+              leaks.push({ type: 'TOO_AGGRESSIVE', position: pos.position, current: aggressionPct.toFixed(1), recommended: '60-80', severity: 'LOW', description: `Possibly too aggressive from ${pos.position} (PFR/VPIP ratio ${aggressionPct.toFixed(1)}% > 90%)` });
+            }
+          }
+        });
+        const totalHandsPreflop = parseFloat(threeBet.total_hands_preflop) || 0;
+        const times3bet = parseFloat(threeBet.times_3bet_or_more) || 0;
+        const threeBetPct = totalHandsPreflop > 0 ? (times3bet / totalHandsPreflop) * 100 : 0;
+        if (threeBetPct < 3) {
+          leaks.push({ type: 'THREE_BET_TOO_LOW', current: threeBetPct.toFixed(2), recommended: '3-8', severity: 'MEDIUM', description: `3-bet frequency too low (${threeBetPct.toFixed(2)}% < 3%)` });
+        } else if (threeBetPct > 10) {
+          leaks.push({ type: 'THREE_BET_TOO_HIGH', current: threeBetPct.toFixed(2), recommended: '3-8', severity: 'LOW', description: `3-bet frequency possibly too high (${threeBetPct.toFixed(2)}% > 10%)` });
+        }
+        const showdownWinrate = parseFloat(showdown.showdown_winrate) || 0;
+        const handsShowdown = parseFloat(showdown.hands_showdown) || 0;
+        if (handsShowdown >= 20) {
+          if (showdownWinrate < 45) {
+            leaks.push({ type: 'SHOWDOWN_WINRATE_TOO_LOW', current: showdownWinrate.toFixed(1), recommended: '45-55', severity: 'HIGH', description: `Showdown win rate too low (${showdownWinrate.toFixed(1)}% < 45%)` });
+          } else if (showdownWinrate > 55) {
+            leaks.push({ type: 'SHOWDOWN_WINRATE_TOO_HIGH', current: showdownWinrate.toFixed(1), recommended: '45-55', severity: 'LOW', description: `Showdown win rate suspiciously high (${showdownWinrate.toFixed(1)}% > 55%) - might be running hot` });
+          }
+        }
+        return {
+          basic_stats: basic,
+          position_stats: positions,
+          three_bet_pct: Number(threeBetPct.toFixed(2)),
+          showdown_stats: showdown,
+          leaks,
+          note: 'total_profit/avg_profit_per_hand are chip/tournament units unless every hand in range is cash.',
+        };
+      });
     }
   );
 

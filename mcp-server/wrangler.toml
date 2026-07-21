@@ -5,9 +5,11 @@ compatibility_flags = ["nodejs_compat"]
 workers_dev = false
 preview_urls = false
 
-routes = [
-  { pattern = "*.leaksnipe.win/hands", zone_name = "leaksnipe.win" }
-]
+# Route(s) for this worker are already configured on the leaksnipe.win zone
+# (dashboard-managed or from an earlier deploy). Declaring them here too makes
+# `wrangler deploy`'s route-sync step fail with 409 Conflict on every deploy —
+# harmless (nothing is created/changed when it fails), but noisy. Manage
+# routes/custom domains via the dashboard instead of wrangler.toml.
 
 [limits]
 cpu_ms = 1

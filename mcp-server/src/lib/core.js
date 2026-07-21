@@ -726,6 +726,20 @@ export async function queryHands(env, filters = {}, opts = {}) {
   });
 }
 
+// ---------- KV-cached analytics (desktop-tunnel-backed, expensive queries) ----------
+
+export const ANALYTICS_CACHE_TTL = 3600;
+
+export async function getOrComputeAnalytics(env, cacheKey, computeFn, ttlSeconds = ANALYTICS_CACHE_TTL) {
+  const cached = await env.HAND_HISTORY_KV.get(`analytics:${cacheKey}`, { type: 'json' });
+  if (cached) return cached;
+  const result = await computeFn();
+  await env.HAND_HISTORY_KV.put(`analytics:${cacheKey}`, JSON.stringify(result), {
+    expirationTtl: ttlSeconds,
+  });
+  return result;
+}
+
 export async function proxyLocalMcp(env, name, args) {
   const resp = await fetch('https://db.leaksnipe.win/mcp', {
     method: 'POST',
