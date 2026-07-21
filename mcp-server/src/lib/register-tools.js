@@ -820,6 +820,26 @@ export function registerAllTools(server) {
   // control); ported here so a repo deploy no longer removes them. Names,
   // schemas, and response shapes match the deployed versions exactly.
 
+  // Pragmas that only introspect — never accepted in assignment form.
+  const D1_SAFE_PRAGMAS = new Set([
+    'table_info',
+    'table_xinfo',
+    'table_list',
+    'index_list',
+    'index_info',
+    'index_xinfo',
+    'foreign_key_list',
+    'database_list',
+    'collation_list',
+    'function_list',
+    'pragma_list',
+    'compile_options',
+    'freelist_count',
+    'page_count',
+    'user_version',
+    'application_id',
+  ]);
+
   server.registerTool(
     'list_full_schemas',
     {
@@ -898,6 +918,18 @@ export function registerAllTools(server) {
       const lower = sql.toLowerCase();
       if (!(lower.startsWith('select') || lower.startsWith('with') || lower.startsWith('pragma'))) {
         throw new Error('Only SELECT/WITH/PRAGMA allowed on D1');
+      }
+      if (lower.startsWith('pragma')) {
+        // PRAGMA is not uniformly read-only: writable_schema, journal_mode,
+        // foreign_keys etc. mutate state, and even readable pragmas accept an
+        // assignment form (PRAGMA user_version = 5). Allow only whitelisted
+        // introspection pragmas in bare or call form.
+        const m = lower.match(/^pragma\s+(?:\w+\.)?(\w+)\s*(\(|$)/);
+        if (!m || !D1_SAFE_PRAGMAS.has(m[1])) {
+          throw new Error(
+            `Only read-only introspection pragmas are allowed: ${[...D1_SAFE_PRAGMAS].join(', ')}`
+          );
+        }
       }
       if (/;/.test(sql.replace(/;+\s*$/, ''))) throw new Error('Multiple statements not allowed');
       const stmt = requireD1(env).prepare(sql);
