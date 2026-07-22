@@ -5,7 +5,13 @@ compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 preview_urls = true
 
-# Custom domain so every wrangler deploy always owns worker.leaksnipe.win
+# Route for the main domain
+[[routes]]
+pattern = "leaksnipe.win"
+custom_domain = true
+zone_name = "leaksnipe.win"
+
+# Route for the worker subdomain
 [[routes]]
 pattern = "worker.leaksnipe.win"
 custom_domain = true
