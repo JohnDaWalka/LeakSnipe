@@ -4014,9 +4014,49 @@ server.registerTool('get_leak_report_cached', {
   );
 });
 
+// Constant-time-ish comparison to avoid leaking the token via response timing.
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  let out = 0;
+  for (let i = 0; i < a.length; i++) out |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return out === 0;
+}
+
+// Bearer-token gate for the MCP tool endpoints. Fails OPEN when MCP_TOKEN is
+// unset (so deploying this change never breaks the live connector); once the
+// MCP_TOKEN secret is set, unauthenticated calls to the tool endpoints get 401.
+function mcpAuthOk(request, url, env) {
+  // Always allow OPTIONS preflight
+  if (request.method === 'OPTIONS') return true;
+  
+  // Allow unauthenticated MCP tool discovery & execution on /mcp for Grok/Claude/Cursor connectors
+  if (url.pathname === '/mcp' || url.pathname.startsWith('/mcp/')) return true;
+
+  const isProtected =
+    url.pathname === '/sse' ||
+    url.pathname.startsWith('/messages');
+  if (!isProtected) return true;
+  if (!env.MCP_TOKEN) return true; // not configured yet → don't lock anyone out
+  const auth = (request.headers.get('Authorization') || '').trim();
+  return safeEqual(auth, `Bearer ${env.MCP_TOKEN}`);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
+    // 1. Universal CORS Preflight Handling (OPTIONS)
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': '*',
+          'Access-Control-Max-Age': '86400'
+        }
+      });
+    }
 
     // Health check endpoint
     if (url.pathname === '/health') {
@@ -4029,7 +4069,12 @@ export default {
         timestamp: new Date().toISOString(),
         services: { d1: d1Ok, kv: kvOk, r2: r2Ok }
       }, null, 2), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        headers: { 
+          'Content-Type': 'application/json', 
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': '*'
+        }
       });
     }
 
@@ -4049,7 +4094,12 @@ export default {
         stats.error = e.message;
       }
       return new Response(JSON.stringify(stats, null, 2), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        headers: { 
+          'Content-Type': 'application/json', 
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': '*'
+        }
       });
     }
 
@@ -4062,7 +4112,31 @@ export default {
       '/.well-known/openid-configuration',
     ];
     if (oauthPaths.includes(url.pathname)) {
-      return new Response('Not found', { status: 404 });
+      return new Response('Not found', { 
+        status: 404,
+        headers: { 
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': '*'
+        }
+      });
+    }
+
+    // Require a valid bearer token for protected MCP tool endpoints (if MCP_TOKEN is set)
+    if (!mcpAuthOk(request, url, env)) {
+      return new Response(
+        JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Unauthorized: missing or invalid bearer token' } }),
+        { 
+          status: 401, 
+          headers: { 
+            'Content-Type': 'application/json', 
+            'WWW-Authenticate': 'Bearer', 
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': '*'
+          } 
+        }
+      );
     }
 
     // Proxy SSE and messages paths to the tunnel (which routes to the local Python MCP server)
@@ -4076,9 +4150,29 @@ export default {
         headers: newHeaders,
         body: request.body
       });
-      return fetch(newRequest);
+      const proxyResp = await fetch(newRequest);
+      const resHeaders = new Headers(proxyResp.headers);
+      resHeaders.set('Access-Control-Allow-Origin', '*');
+      resHeaders.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      resHeaders.set('Access-Control-Allow-Headers', '*');
+      return new Response(proxyResp.body, {
+        status: proxyResp.status,
+        statusText: proxyResp.statusText,
+        headers: resHeaders
+      });
     }
-    return server.handleRequest(request, env);
+
+    // Handle MCP Server Request and inject universal CORS headers
+    const mcpResponse = await server.handleRequest(request, env);
+    const mcpHeaders = new Headers(mcpResponse.headers);
+    mcpHeaders.set('Access-Control-Allow-Origin', '*');
+    mcpHeaders.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    mcpHeaders.set('Access-Control-Allow-Headers', '*');
+    return new Response(mcpResponse.body, {
+      status: mcpResponse.status,
+      statusText: mcpResponse.statusText,
+      headers: mcpHeaders
+    });
   },
 
   async queue(batch, env) {
