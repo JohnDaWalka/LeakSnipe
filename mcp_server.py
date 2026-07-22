@@ -5,9 +5,13 @@ import sqlite3
 import traceback
 from datetime import datetime
 
-# Add sidecar folder to import search path
+# Add REPO_ROOT and sidecar folder to import search path
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.join(REPO_ROOT, "sidecar"))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+sidecar_dir = os.path.join(REPO_ROOT, "sidecar")
+if sidecar_dir not in sys.path:
+    sys.path.insert(0, sidecar_dir)
 
 # Redirect stdout print statements to stderr to prevent corrupting JSON-RPC on stdout
 def log_err(msg):
