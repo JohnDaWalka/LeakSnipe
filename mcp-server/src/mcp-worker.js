@@ -2152,7 +2152,7 @@ class McpServer {
 
       if (method === 'initialize') {
         return new Response(JSON.stringify({
-          jsonrpc: '2.0', id: id ?? 1,
+          jsonrpc: '2.0', id,
           result: {
             protocolVersion: '2024-11-05',
             capabilities: {
@@ -2166,7 +2166,7 @@ class McpServer {
       }
 
       if (method === 'ping') {
-        return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? 1, result: {} }),
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id, result: {} }),
           { headers: { 'Content-Type': 'application/json' } });
       }
 
@@ -2175,27 +2175,27 @@ class McpServer {
           name, description: t.schema.description,
           inputSchema: { type: 'object', properties: t.schema.properties, required: t.schema.required || [] }
         }));
-        return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? 1, result: { tools: toolsList } }),
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id, result: { tools: toolsList } }),
           { headers: { 'Content-Type': 'application/json' } });
       }
 
       if (method === 'resources/list') {
-        return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? 1, result: { resources: [] } }),
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id, result: { resources: [] } }),
           { headers: { 'Content-Type': 'application/json' } });
       }
 
       if (method === 'resources/templates/list') {
-        return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? 1, result: { resourceTemplates: [] } }),
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id, result: { resourceTemplates: [] } }),
           { headers: { 'Content-Type': 'application/json' } });
       }
 
       if (method === 'prompts/list') {
-        return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? 1, result: { prompts: [] } }),
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id, result: { prompts: [] } }),
           { headers: { 'Content-Type': 'application/json' } });
       }
 
       if (method === 'completion/complete') {
-        return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? 1, result: { completion: { values: [], hasMore: false } } }),
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id, result: { completion: { values: [], hasMore: false } } }),
           { headers: { 'Content-Type': 'application/json' } });
       }
 
@@ -2203,15 +2203,15 @@ class McpServer {
         const { name, arguments: args } = params || {};
         const tool = this.tools.get(name);
         if (!tool) {
-          return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? 1, error: { code: -32601, message: `Tool '${name}' not found` } }),
+          return new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32601, message: `Tool '${name}' not found` } }),
             { headers: { 'Content-Type': 'application/json' } });
         }
         try {
           const result = await tool.handler(args, env);
-          return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? 1, result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] } }),
+          return new Response(JSON.stringify({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] } }),
             { headers: { 'Content-Type': 'application/json' } });
         } catch (err) {
-          return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? 1, error: { code: -32603, message: err.message } }),
+          return new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32603, message: err.message } }),
             { headers: { 'Content-Type': 'application/json' } });
         }
       }
