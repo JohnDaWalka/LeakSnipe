@@ -4018,6 +4018,41 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // Health check endpoint
+    if (url.pathname === '/health') {
+      let d1Ok = false, kvOk = false, r2Ok = false;
+      try { if (env.DB) { await env.DB.prepare('SELECT 1').first(); d1Ok = true; } } catch (e) {}
+      try { if (env.HAND_META) { await env.HAND_META.get('health_check'); kvOk = true; } } catch (e) {}
+      try { if (env.HAND_HISTORY_R2) { await env.HAND_HISTORY_R2.list({ limit: 1 }); r2Ok = true; } } catch (e) {}
+      return new Response(JSON.stringify({
+        status: (d1Ok && kvOk && r2Ok) ? 'healthy' : 'degraded',
+        timestamp: new Date().toISOString(),
+        services: { d1: d1Ok, kv: kvOk, r2: r2Ok }
+      }, null, 2), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    // Stats summary endpoint
+    if (url.pathname === '/stats') {
+      let stats = { total_hands: 0, sites: [], total_sessions: 0 };
+      try {
+        if (env.DB) {
+          const handsRes = await env.DB.prepare('SELECT COUNT(*) as cnt FROM hands').first();
+          stats.total_hands = handsRes ? handsRes.cnt : 0;
+          const sitesRes = await env.DB.prepare('SELECT site, COUNT(*) as count FROM hands GROUP BY site').all();
+          stats.sites = sitesRes ? sitesRes.results : [];
+          const sessRes = await env.DB.prepare('SELECT COUNT(*) as cnt FROM sessions').first();
+          stats.total_sessions = sessRes ? sessRes.cnt : 0;
+        }
+      } catch (e) {
+        stats.error = e.message;
+      }
+      return new Response(JSON.stringify(stats, null, 2), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
     // Return 404 for OAuth/OIDC discovery paths so that spec-compliant MCP
     // clients (Claude Connectors, etc.) see "no auth required" and connect
     // directly without attempting an OAuth flow (which would produce ofid_* errors).
@@ -4044,5 +4079,12 @@ export default {
       return fetch(newRequest);
     }
     return server.handleRequest(request, env);
+  },
+
+  async queue(batch, env) {
+    for (const message of batch.messages) {
+      console.log(`Processing queue message ${message.id}:`, message.body);
+      message.ack();
+    }
   }
 };
