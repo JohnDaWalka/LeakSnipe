@@ -21,11 +21,6 @@ cpu_ms = 50
 [placement]
 mode = "smart"
 
-[[durable_objects.bindings]]
-name = "Durable_Container"
-class_name = "MyContainer"
-script_name = "containers-template"
-
 [[r2_buckets]]
 binding = "HAND_HISTORY_R2"
 bucket_name = "leaksnipe-hand-histories"
