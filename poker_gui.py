@@ -3792,55 +3792,93 @@ def _hud_stat_color(t, stat_name, value):
 
 # ─── Live HUD — Seat Badge (DriveHUD2-style) ─────────────────────────────────
 class SeatBadge(tk.Canvas):
-    """DriveHUD2-style seat badge: floating name label + dark grid card with
-    colour-coded stats (VPIP/PFR/AF/WSD row-1; FCBet/type row-2)."""
+    """DriveHUD2-style seat badge with zero-flicker in-place updating and detailed stats."""
 
     W, H = 166, 96   # class-level defaults; overridden per preset
 
-    # Primary stats: 4 columns, always shown
     _ROW1 = [
         ("VPIP",  "vpip",      "%"),
         ("PFR",   "pfr",       "%"),
         ("3B",    "three_bet", "%"),
         ("AF",    "af",        ""),
     ]
-    # Secondary stats: shown when rows==2
     _ROW2 = [
         ("WSD",   "wtsd",      "%"),
         ("FCBet", "fold_cbet", "%"),
-        (None, None, None),   # spacer
-        (None, None, None),   # spacer
+        ("WTSD",  "wtsd",      "%"),
+        ("WSD%",  "wsd",       "%"),
     ]
 
     def __init__(self, parent, theme, player_info, stat, density="standard", db=None, loading=False,
-                 badge_scale=1.0, table_position=None, pos_stats=None, **kwargs):
-        t = theme
-        self._theme = t
-        self._stat  = stat
+                 badge_scale=1.0, table_position=None, pos_stats=None, detailed=True, **kwargs):
+        self._theme = theme
         self._db    = db
+        self._tooltip = None
+        self._pinned = False
+        self._drag_moved = False
+        self.W, self.H = 166, 96
+
+        super().__init__(parent, width=166, height=96,
+                         bg=_HUD_COLORKEY, highlightthickness=0, **kwargs)
+
+        self.update_badge_data(
+            player_info=player_info,
+            stat=stat,
+            density=density,
+            loading=loading,
+            table_position=table_position,
+            pos_stats=pos_stats,
+            badge_scale=badge_scale,
+            detailed=detailed
+        )
+
+        self.bind("<Enter>", self._show_tooltip)
+        self.bind("<Leave>", self._hide_tooltip)
+
+    def update_badge_data(self, player_info, stat, density="standard", loading=False,
+                          table_position=None, pos_stats=None, badge_scale=1.0, detailed=True):
+        """In-place redraw on existing canvas — ZERO FLICKER / ZERO WINDOW DESTRUCTION."""
+        self._stat = stat
         self._loading = loading
         self._table_position = table_position
         self._pos_stats = pos_stats or {}
+        self._density = density
+        self._badge_scale = badge_scale
+        self._detailed = detailed
 
+        name = player_info.get("name", "?")
+        self._player_name = name
+
+        t = self._theme
         display_stat = dict(stat) if stat else {}
         pos_label = table_position
+        pos_vpip_str = None
+        pos_pfr_str = None
+        pos_hands = 0
         if pos_label and self._pos_stats:
             ps = self._pos_stats.get(pos_label) or {}
-            if ps.get("hands", 0) > 0:
+            pos_hands = ps.get("hands", 0)
+            if pos_hands > 0:
                 display_stat = {**display_stat, "vpip": ps.get("vpip", 0), "pfr": ps.get("pfr", 0)}
+                pos_vpip_str = f"{ps.get('vpip', 0):.0f}%"
+                pos_pfr_str = f"{ps.get('pfr', 0):.0f}%"
 
         p = scaled_hud_density_preset(density, badge_scale)
         LABEL_H = max(16, int(round(20 * badge_scale)))
         W  = p["width"]
         CH = p["height"]      # card height
+        
+        POS_ROW_H = 0
+        if detailed and pos_label:
+            POS_ROW_H = max(14, int(round(16 * badge_scale)))
+            CH += POS_ROW_H
+
         H  = CH + LABEL_H     # total canvas height
         self.W, self.H = W, H
 
-        super().__init__(parent, width=W, height=H,
-                         bg=_HUD_COLORKEY, highlightthickness=0, **kwargs)
+        self.configure(width=W, height=H)
+        self.delete("all")
 
-        name           = player_info.get("name", "?")
-        self._player_name = name
         if loading:
             classification = "..."
         else:
@@ -3865,7 +3903,6 @@ class SeatBadge(tk.Canvas):
         HEADER_H = max(14, int(round(18 * badge_scale)))
         HDR_BG   = _darken(BG, 0.08)
         self._rrect(0, LABEL_H, W - 6, LABEL_H + HEADER_H, r, fill=HDR_BG, outline="")
-        # flatten bottom of header (re-draw lower half as plain rect)
         self.create_rectangle(0, LABEL_H + HEADER_H // 2,
                                W - 6, LABEL_H + HEADER_H,
                                fill=HDR_BG, outline="")
@@ -3888,10 +3925,9 @@ class SeatBadge(tk.Canvas):
         COLS   = 4
         col_w  = (W - 6) / COLS
         rows   = p.get("rows", 2)
-        # vertical space for stats inside card (below header, above bottom padding)
         stats_top    = LABEL_H + HEADER_H + 2
-        stats_bottom = H - 8
-        row_h        = (stats_bottom - stats_top) / rows
+        stats_bottom = H - 8 - POS_ROW_H
+        row_h        = (stats_bottom - stats_top) / max(1, rows)
 
         def _draw_stat_cell(col_idx, row_idx, label, key, suffix):
             if label is None:
@@ -3908,7 +3944,6 @@ class SeatBadge(tk.Canvas):
                 raw = display_stat.get(key, 0)
                 val_str, val_col = _hud_format_stat_value(t, key, raw, suffix)
 
-            # column divider (skip leftmost)
             if col_idx > 0:
                 div_x = int(col_w * col_idx)
                 self.create_line(div_x, stats_top + 2,
@@ -3924,14 +3959,12 @@ class SeatBadge(tk.Canvas):
             _draw_stat_cell(ci, 0, lbl, key, sfx)
 
         if rows >= 2:
-            # horizontal divider between rows
             mid_y = int(stats_top + row_h)
             self.create_line(4, mid_y, W - 10, mid_y, fill=BDR)
             for ci, (lbl, key, sfx) in enumerate(self._ROW2):
                 if lbl:
                     _draw_stat_cell(ci, 1, lbl, key, sfx)
                 elif ci == 2 and rows >= 2:
-                    # cols 2-3: exploit tip
                     tip = EXPLOIT_TIPS.get(classification, "")
                     if tip:
                         tip_cx = col_w * 2.5
@@ -3947,12 +3980,13 @@ class SeatBadge(tk.Canvas):
                                          width=int(col_w * 2 - 4))
                     break
 
-        # Hover / click tooltip bindings
-        self._tooltip = None
-        self._pinned = False
-        self._drag_moved = False
-        self.bind("<Enter>", self._show_tooltip)
-        self.bind("<Leave>", self._hide_tooltip)
+        # ── Detailed Positional Stats Row (Continuous Display) ────────────────
+        if POS_ROW_H > 0 and pos_label:
+            pos_y = H - POS_ROW_H // 2 - 4
+            self.create_line(4, H - POS_ROW_H - 4, W - 10, H - POS_ROW_H - 4, fill=BDR)
+            pos_txt = f"{pos_label} VPIP:{pos_vpip_str or '–'} PFR:{pos_pfr_str or '–'} ({pos_hands}h)"
+            self.create_text(W // 2, pos_y, text=pos_txt, anchor="center",
+                             fill=t.get("gold", "#FFD700"), font=p["type_font"])
 
     def _show_tooltip(self, event=None):
         if self._tooltip or not self._db:
@@ -4774,24 +4808,18 @@ class LiveHUDOverlay:
         badge_offsets, w, h, stats_by_name, loading=False,
         seat_positions=None, pos_stats_by_name=None,
     ):
-        """Add/update/remove badges to match the current seat roster."""
+        """Add/update/remove badges to match the current seat roster without window destruction."""
         seat_positions = seat_positions or {}
         pos_stats_by_name = pos_stats_by_name or {}
         desired = self._desired_villain_seats(seat_map)
+        
+        # 1. Remove badges for seats where player has left
         for seat in list(self._badges.keys()):
-            badge = self._badges.get(seat)
             expected_name = desired.get(seat)
             if expected_name is None:
                 self._remove_badge(seat)
-                continue
-            stat = stats_by_name.get(expected_name)
-            table_position = seat_positions.get(seat)
-            pos_stats = pos_stats_by_name.get(expected_name)
-            if badge is not None and self._badge_should_rebuild(
-                badge, expected_name, stat, loading, table_position, pos_stats,
-            ):
-                self._remove_badge(seat)
 
+        # 2. Add or update existing badges IN-PLACE (No window destroy -> Zero Blinking!)
         for seat, pname in desired.items():
             stat = stats_by_name.get(pname)
             table_position = seat_positions.get(seat)
@@ -4803,6 +4831,19 @@ class LiveHUDOverlay:
                 pos = layout.get(seat_to_slot.get(seat))
                 if pos is None:
                     continue
+
+                # Redraw canvas in-place on existing host window
+                badge.update_badge_data(
+                    player_info=seat_map.get(seat, {"name": pname}),
+                    stat=stat,
+                    density=density,
+                    loading=badge_loading,
+                    table_position=table_position,
+                    pos_stats=pos_stats,
+                    badge_scale=self._badge_scale(),
+                    detailed=True,
+                )
+
                 seat_offset = self._slot_offset(badge_offsets, seat_to_slot, seat)
                 px, py = self._resolve_badge_xy(
                     pos, seat_offset, badge_dx, badge_dy, w, h, badge.W, badge.H,
@@ -4810,6 +4851,7 @@ class LiveHUDOverlay:
                 self._position_badge_host(seat, px, py, badge)
                 continue
 
+            # Create new badge host window only for new seats
             info = seat_map.get(seat, {"name": pname})
             pos = layout.get(seat_to_slot.get(seat))
             if pos is None:
@@ -4821,6 +4863,7 @@ class LiveHUDOverlay:
                 badge_scale=self._badge_scale(),
                 table_position=table_position,
                 pos_stats=pos_stats,
+                detailed=True,
             )
             seat_offset = self._slot_offset(badge_offsets, seat_to_slot, seat)
             px, py = self._resolve_badge_xy(
