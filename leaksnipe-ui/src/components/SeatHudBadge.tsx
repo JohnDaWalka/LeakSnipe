@@ -25,6 +25,8 @@ export function SeatHudBadge({ stats, name, seat, layoutMode, pinned }: SeatHudB
       .slice(0, 9);
   }, [stats?.by_position]);
 
+  const topPos = positions[0];
+
   return (
     <div
       className={`live-seat-badge ${layoutMode ? "layout-mode" : ""} ${pinned ? "pinned" : ""}`}
@@ -86,6 +88,11 @@ export function SeatHudBadge({ stats, name, seat, layoutMode, pinned }: SeatHudB
                 </span>
               </div>
             </div>
+            {topPos ? (
+              <div className="hud-pos-summary-row" style={{ marginTop: 2, fontSize: "10px", color: "#FFD700", textAlign: "center", fontWeight: "bold" }}>
+                {topPos[0]}: VPIP {topPos[1].vpip}% / PFR {topPos[1].pfr}% ({topPos[1].hands}h)
+              </div>
+            ) : null}
           </>
         ) : (
           <div className="hud-badge-card muted small live-loading">Loading…</div>
