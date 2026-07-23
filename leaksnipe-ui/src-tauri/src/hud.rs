@@ -279,6 +279,17 @@ fn collect_table_windows() -> Vec<TableBounds> {
         if w < 150 || h < 100 {
             return BOOL(1);
         }
+        // Defense in depth alongside the IsIconic check above: reject rects
+        // parked at the classic Windows minimized/off-screen sentinel
+        // (roughly -32000,-32000) or anywhere similarly far off-screen, in
+        // case a window reports a bogus rect for some other reason (e.g. a
+        // state-transition race, or a window left on a since-removed
+        // monitor). -10000 stays well clear of any legitimate multi-monitor
+        // negative offset while still catching the sentinel with margin.
+        const OFFSCREEN_BOUND: i32 = -10000;
+        if rect.left <= OFFSCREEN_BOUND || rect.top <= OFFSCREEN_BOUND {
+            return BOOL(1);
+        }
 
         let entry = TableBounds {
             hwnd: hwnd.0 as isize,

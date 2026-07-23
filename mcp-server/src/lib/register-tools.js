@@ -1305,14 +1305,27 @@ export function registerAllTools(server) {
           GROUP BY h.hero_position`,
           [playerName, range]
         );
-        const threeBetStats = await dbQuery(
+        // hero_times_3bet_or_more is a per-hand indicator (1 or 0 per hand,
+        // then aggregated into a %, same convention as vpip_pct/pfr_pct
+        // above) counting hands where the HERO's own preflop raise was itself
+        // a re-raise (a prior preflop raise by anyone already existed at a
+        // lower sequence) — a 3-bet, 4-bet, etc. Named "hero_*" specifically
+        // so it isn't mistaken for a raw/table-wide 3-bet frequency: the
+        // previous version counted total preflop bet/raise actions by ANYONE
+        // in the hand, which measured "the hand saw multiple raises," not
+        // the hero's own 3-bet frequency.
+        const heroThreeBetStats = await dbQuery(
           env,
           `SELECT
             COUNT(*) AS total_hands_preflop,
-            SUM(CASE WHEN (
-              SELECT COUNT(*) FROM actions a2 WHERE a2.hand_id = h.hand_id AND a2.street = 'Preflop'
-                AND a2.action IN ('bet','raise')
-            ) >= 2 THEN 1 ELSE 0 END) AS times_3bet_or_more
+            SUM(CASE WHEN EXISTS (
+              SELECT 1 FROM actions a2 WHERE a2.hand_id = h.hand_id AND a2.street = 'Preflop'
+                AND a2.player = p.name AND a2.action = 'raise'
+                AND EXISTS (
+                  SELECT 1 FROM actions a3 WHERE a3.hand_id = a2.hand_id AND a3.street = 'Preflop'
+                    AND a3.action = 'raise' AND a3.sequence < a2.sequence
+                )
+            ) THEN 1 ELSE 0 END) AS hero_times_3bet_or_more
           FROM hands h
           JOIN players p ON p.hand_id = h.hand_id AND p.is_hero = 1 AND p.name = ?
           WHERE h.date >= datetime('now', ?)
@@ -1339,7 +1352,7 @@ export function registerAllTools(server) {
 
         const basic = basicStats.results?.[0] || {};
         const positions = positionStats.results || [];
-        const threeBet = threeBetStats.results?.[0] || {};
+        const heroThreeBet = heroThreeBetStats.results?.[0] || {};
         const showdown = showdownStats.results?.[0] || {};
         const leaks = [];
         const RANGES = {
@@ -1364,9 +1377,9 @@ export function registerAllTools(server) {
             }
           }
         });
-        const totalHandsPreflop = parseFloat(threeBet.total_hands_preflop) || 0;
-        const times3bet = parseFloat(threeBet.times_3bet_or_more) || 0;
-        const threeBetPct = totalHandsPreflop > 0 ? (times3bet / totalHandsPreflop) * 100 : 0;
+        const totalHandsPreflop = parseFloat(heroThreeBet.total_hands_preflop) || 0;
+        const heroTimes3bet = parseFloat(heroThreeBet.hero_times_3bet_or_more) || 0;
+        const threeBetPct = totalHandsPreflop > 0 ? (heroTimes3bet / totalHandsPreflop) * 100 : 0;
         if (threeBetPct < 3) {
           leaks.push({ type: 'THREE_BET_TOO_LOW', current: threeBetPct.toFixed(2), recommended: '3-8', severity: 'MEDIUM', description: `3-bet frequency too low (${threeBetPct.toFixed(2)}% < 3%)` });
         } else if (threeBetPct > 10) {
