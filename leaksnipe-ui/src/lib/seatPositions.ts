@@ -53,9 +53,9 @@ export const SEAT_POSITIONS: Record<SeatLayoutKey, Record<number, [number, numbe
 
     4: [0.72, 0.18],
 
-    5: [0.62, 0.1],
+    5: [0.62, 0.16],
 
-    6: [0.38, 0.1],
+    6: [0.38, 0.16],
 
     7: [0.28, 0.18],
 
