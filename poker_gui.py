@@ -529,28 +529,33 @@ class HandDatabase:
                 conn.close()
 
     def hand_needs_hero_backfill(self, hand_id):
-        """True when stored hero cards or position are missing."""
+        """True when stored hero cards/position, or seat/button info, are missing."""
         with self.lock:
             conn = self._connect()
             try:
                 row = conn.execute(
-                    "SELECT hero_cards, hero_position FROM hands WHERE hand_id = ?",
+                    "SELECT hero_cards, hero_position, max_seats, button_seat "
+                    "FROM hands WHERE hand_id = ?",
                     (hand_id,),
                 ).fetchone()
                 if not row:
                     return False
                 cards = (row[0] or "").strip()
                 position = (row[1] or "").strip()
-                return not cards or not position or position == "?"
+                missing_hero = not cards or not position or position == "?"
+                missing_seats = not (row[2] or 0) or not (row[3] or 0)
+                return missing_hero or missing_seats
             finally:
                 conn.close()
 
     @staticmethod
     def hand_has_hero_fields(hand):
-        """True when a parsed hand has usable hero cards and position."""
+        """True when a parsed hand has usable hero cards/position, or seat/button info."""
         cards = (getattr(hand, "hero_cards", "") or "").strip()
         position = (getattr(hand, "hero_position", "") or "").strip()
-        return bool(cards) and bool(position) and position != "?"
+        has_hero = bool(cards) and bool(position) and position != "?"
+        has_seats = bool(getattr(hand, "max_seats", 0)) and bool(getattr(hand, "button_seat", 0))
+        return has_hero or has_seats
 
     def save_hand(self, hand, source_file=""):
         with self.lock:
