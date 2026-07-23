@@ -2133,7 +2133,7 @@ class McpServer {
       });
     }
 
-    if (url.pathname === '/mcp' && request.method === 'POST') {
+    if ((url.pathname === '/mcp' || url.pathname === '/mcp/' || url.pathname === '/') && request.method === 'POST') {
       const corsHeaders = {
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': '*',
@@ -2229,9 +2229,10 @@ class McpServer {
 
       if (method === 'tools/call') {
         const { name, arguments: args } = params || {};
-        const tool = this.tools.get(name);
+        const cleanName = (name || '').replace(/^(?:leak_?snipe(?:_beta)?|leaksnipee)___/i, '');
+        const tool = this.tools.get(name) || this.tools.get(cleanName);
         if (!tool) {
-          return new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32601, message: `Tool '${name}' not found` } }),
+          return new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32601, message: `Tool '${name}' (or '${cleanName}') not found` } }),
             { headers: corsHeaders });
         }
         try {
