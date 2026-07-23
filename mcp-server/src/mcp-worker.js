@@ -2084,6 +2084,7 @@ class McpServer {
   async handleRequest(request, env) {
     const url = new URL(request.url);
 
+
     // GET /mcp — MCP transport discovery & SSE connection handler for Claude, Grok, Cursor, etc.
     if (url.pathname === '/mcp' && request.method === 'GET') {
       const accept = (request.headers.get('Accept') || '').toLowerCase();
@@ -2422,7 +2423,7 @@ class McpServer {
     if (url.pathname === '/') {
       return new Response(LANDING_HTML, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0', 'CDN-Cache-Control': 'no-store', 'Cloudflare-CDN-Cache-Control': 'no-store' } });
     }
-    return new Response('Not found', { status: 404 });
+    return new Response(JSON.stringify({ debug: '404 in McpServer.handleRequest', pathname: url.pathname, method: request.method, url: request.url }), { status: 404, headers: { 'Content-Type': 'application/json' } });
   }
 }
 
