@@ -2192,19 +2192,22 @@ class McpServer {
       }
 
       if (method === 'tools/list') {
-        const toolsList = Array.from(this.tools.entries()).map(([name, t]) => ({
-          name, description: t.schema.description,
-          inputSchema: { type: 'object', properties: t.schema.properties, required: t.schema.required || [] }
-        }));
-        return new Response(JSON.stringify({ jsonrpc: '2.0', id, result: { tools: toolsList } }),
-          {
-            headers: {
-              'Content-Type': 'application/json',
-              'Access-Control-Allow-Origin': '*',
-              'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-              'Access-Control-Allow-Headers': '*'
+        try {
+          const toolsList = Array.from(this.tools.entries()).map(([name, t]) => ({
+            name,
+            description: (t && t.schema && t.schema.description) || '',
+            inputSchema: {
+              type: 'object',
+              properties: (t && t.schema && t.schema.properties) || {},
+              required: (t && t.schema && t.schema.required) || []
             }
-          });
+          }));
+          return new Response(JSON.stringify({ jsonrpc: '2.0', id, result: { tools: toolsList } }),
+            { headers: corsHeaders });
+        } catch (err) {
+          return new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32603, message: 'tools/list failed: ' + err.message } }),
+            { status: 500, headers: corsHeaders });
+        }
       }
 
       if (method === 'resources/list') {
