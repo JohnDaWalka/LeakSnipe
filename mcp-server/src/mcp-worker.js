@@ -4321,7 +4321,7 @@ function mcpAuthOk(request, url, env) {
   
   // Allow unauthenticated MCP tool discovery & execution on /mcp, /sse, /messages, and /.well-known/
   if (
-    url.pathname === '/mcp' || url.pathname.startsWith('/mcp/') ||
+    url.pathname === '/' || url.pathname === '/mcp' || url.pathname.startsWith('/mcp/') ||
     url.pathname === '/sse' || url.pathname.startsWith('/sse/') ||
     url.pathname === '/messages' || url.pathname.startsWith('/messages/') ||
     url.pathname.startsWith('/.well-known/')
