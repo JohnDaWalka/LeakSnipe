@@ -734,6 +734,25 @@ def search_hands(
     }
 
 
+@app.get("/api/tournaments/rollup")
+def get_tournament_rollup(
+    site: Optional[str] = Query(None, description="e.g. CoinPoker"),
+    tournament_id: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    """Tournament summary computed on demand from hands+players.
+
+    tournament_summaries (models.HandDatabase.get_tournament_summaries) is
+    only ever populated from WPN/BetACR .ots files, so it never covers
+    CoinPoker. This works for any site with imported hand data instead.
+    finish_position/prize are always null here since they aren't derivable
+    from hand-history data; see get_tournament_hand_rollup in models.py for
+    what is and isn't computed and why.
+    """
+    db = _get_db()
+    rollup = db.get_tournament_hand_rollup(site=site, tournament_id=tournament_id)
+    return {"ok": True, "count": len(rollup), "tournaments": rollup}
+
+
 @app.get("/api/hands/{hand_id}")
 def get_hand(hand_id: str) -> Dict[str, Any]:
     settings = load_settings()
