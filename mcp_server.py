@@ -23,6 +23,7 @@ try:
     from paths import resolve_db_path
     from config import load_settings
     from utils import resolve_hand_hero_name
+    from coach_memory import CoachMemory, DEFAULT_MEMORY_DB
 except Exception as e:
     log_err(f"Imports failed: {e}\n{traceback.format_exc()}")
     sys.exit(1)
@@ -182,6 +183,39 @@ def parse_natural_language_query(query: str) -> tuple[str, list, int]:
         where_str = " WHERE " + " AND ".join(where_clauses)
     return where_str, params, limit
 
+def session_id_cte(gap_minutes: int = 30) -> str:
+    """A CTE that tags every row in `hands` with a computed session_id — a per-site
+    sit-down grouping using the same gap-based heuristic as calculate_sessions/
+    get_sessions_winrate (default 30min gap). Must run over the FULL, unfiltered hand
+    history per site (LAG needs the true previous hand's date) — any caller-supplied
+    filter has to be applied outside this CTE (`SELECT * FROM session_hands WHERE ...`),
+    never folded into it, or the gap calculation silently breaks (windowing over an
+    already-filtered subset collapses everything into session_id=1). Computed at query
+    time, not persisted, so it can't drift from that shared definition.
+
+    Split into two CTE steps (gaps, then session_hands) rather than nesting LAG()
+    directly inside SUM()'s argument — SQLite rejects a window function used as an
+    input expression to another window function in the same SELECT ("misuse of window
+    function LAG()"), verified against sqlite3 3.45.1 locally. The pre-existing
+    get_sessions_winrate/calculate_sessions queries have this same nested pattern and
+    hit the same error — out of scope here, but worth fixing separately."""
+    gm = min(max(int(gap_minutes or 30), 1), 1440)
+    return f"""
+        WITH gaps AS (
+            SELECT h.*,
+                LAG(h.date) OVER (PARTITION BY h.site ORDER BY h.date) AS prev_date
+            FROM hands h
+        ),
+        session_hands AS (
+            SELECT *,
+                SUM(CASE WHEN
+                    prev_date IS NULL OR (julianday(date) - julianday(prev_date)) * 24 * 60 > {gm}
+                THEN 1 ELSE 0 END) OVER (PARTITION BY site ORDER BY date) AS session_id
+            FROM gaps
+        )
+    """
+
+
 def query_and_serialize_hands(db, settings, sql, params):
     with db.lock:
         conn = db._connect()
@@ -192,6 +226,11 @@ def query_and_serialize_hands(db, settings, sql, params):
             if not rows:
                 return []
             hand_ids = [row["hand_id"] for row in rows]
+            session_ids = {
+                row["hand_id"]: row["session_id"]
+                for row in rows
+                if "session_id" in row.keys()
+            }
             players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand = (
                 db._load_related_for_ids(c, hand_ids)
             )
@@ -202,9 +241,74 @@ def query_and_serialize_hands(db, settings, sql, params):
                 for row in rows
             ]
             fmt = "summary"
-            return [serialize_hand(h, settings, format=fmt) for h in hands]
+            serialized = [serialize_hand(h, settings, format=fmt) for h in hands]
+            if session_ids:
+                for s in serialized:
+                    s["session_id"] = session_ids.get(s.get("hand_id"))
+            return serialized
         finally:
             conn.close()
+
+def get_live_table_state(db, settings, site=None, table=None):
+    """Latest imported hand's seat map — mirrors sidecar/server.py's live_current_hand().
+    Note: hand histories only land after a hand completes, so this reflects the latest
+    completed hand, not a mid-hand snapshot — stacks are that hand's starting stacks."""
+    heroes = set()
+    for aliases in (settings.get("hero_names") or {}).values():
+        for alias in str(aliases).split(","):
+            alias = alias.strip()
+            if alias:
+                heroes.add(alias)
+
+    hands = db.get_hands_page(50, 0)
+    hand = None
+    site_filter = (site or "").strip()
+    table_filter = (table or "").strip().lower()
+    if table_filter == "coinpoker":
+        table_filter = ""
+    for h in hands:
+        if site_filter and h.site.lower() != site_filter.lower():
+            continue
+        if table_filter:
+            h_table = (h.table_name or "").strip().lower()
+            h_tid = str(h.tournament_id or "").strip().lower()
+            if table_filter not in h_table and h_table not in table_filter and table_filter != h_tid:
+                continue
+        hand = h
+        break
+    if hand is None and site_filter:
+        for h in hands:
+            if h.site.lower() == site_filter.lower():
+                hand = h
+                break
+    if hand is None and hands:
+        hand = hands[0]
+
+    if not hand:
+        return {
+            "ok": True, "hand_id": None, "site": None, "max_seats": 6,
+            "seat_map": {}, "opponents": [], "table_name": None,
+        }
+
+    seat_map = {}
+    opponents = []
+    for seat, info in sorted(hand.players.items()):
+        name = str(info.get("name") or "").strip()
+        is_hero = bool(info.get("is_hero")) or name in heroes
+        seat_map[str(seat)] = {"name": name, "is_hero": is_hero, "stack": info.get("stack")}
+        if name and not is_hero:
+            opponents.append(name)
+
+    return {
+        "ok": True,
+        "hand_id": hand.hand_id,
+        "site": hand.site,
+        "max_seats": hand.max_seats or 6,
+        "seat_map": seat_map,
+        "opponents": opponents,
+        "table_name": hand.table_name,
+    }
+
 
 def calculate_sessions(db, settings, site=None, gap_minutes=30, limit=10):
     from collections import defaultdict
@@ -393,7 +497,8 @@ def handle_request(req):
                             "properties": {
                                 "query": {"type": "string", "description": "Natural language search query like '3-bet from cutoff'"},
                                 "limit": {"type": "integer", "description": "Max hands to return (default 10)"},
-                                "offset": {"type": "integer", "description": "Pagination offset"}
+                                "offset": {"type": "integer", "description": "Pagination offset"},
+                                "gap_minutes": {"type": "integer", "description": "Session-boundary gap in minutes for the computed session_id (default 30)"}
                             },
                             "required": ["query"]
                         }
@@ -405,7 +510,8 @@ def handle_request(req):
                             "type": "object",
                             "properties": {
                                 "limit": {"type": "integer", "description": "Max hands to return (default 10)"},
-                                "since": {"type": "string", "description": "ISO timestamp (YYYY-MM-DD) to get hands after"}
+                                "since": {"type": "string", "description": "ISO timestamp (YYYY-MM-DD) to get hands after"},
+                                "gap_minutes": {"type": "integer", "description": "Session-boundary gap in minutes for the computed session_id (default 30)"}
                             }
                         }
                     },
@@ -463,6 +569,20 @@ def handle_request(req):
                         }
                     },
                     {
+                        "name": "get_hand_by_number",
+                        "description": "Get exactly one hand by its hand_number (reliable single-hand lookup — use this instead of get_hand_detail/search_hands when you know the hand number, not the internal hand_id). Pass site and/or tournament_id to disambiguate if the same hand_number appears more than once.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "hand_number": {"type": "string", "description": "The hand_number to look up, e.g. '96'"},
+                                "site": {"type": "string", "description": "Optional site filter to disambiguate (e.g. 'BetACR', 'CoinPoker')"},
+                                "tournament_id": {"type": "string", "description": "Optional tournament_id filter to disambiguate"},
+                                "gap_minutes": {"type": "integer", "description": "Session-boundary gap in minutes for the computed session_id (default 30)"}
+                            },
+                            "required": ["hand_number"]
+                        }
+                    },
+                    {
                         "name": "add_tag",
                         "description": "Tag a specific hand with a label.",
                         "inputSchema": {
@@ -495,6 +615,43 @@ def handle_request(req):
                                 "site": {"type": "string", "description": "Filter by poker site (e.g. 'CoinPoker', 'BetACR')"},
                                 "gap_minutes": {"type": "integer", "description": "Minutes gap between hands to define a new session (default 30)"},
                                 "limit": {"type": "integer", "description": "Max sessions to return (default 10)"}
+                            }
+                        }
+                    },
+                    {
+                        "name": "get_live_table_read",
+                        "description": "Live read on the current table: seats/last-known stacks from the most recently imported hand, plus career VPIP/PFR/AF/WTSD/3-bet for every opponent currently seated. Note: hand histories only land after a hand completes, so this reflects the latest completed hand, not a mid-hand snapshot.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "site": {"type": "string", "description": "Optional site filter (e.g. 'BetACR', 'CoinPoker')"},
+                                "table": {"type": "string", "description": "Optional table name/tournament_id filter"}
+                            }
+                        }
+                    },
+                    {
+                        "name": "write_coach_memory",
+                        "description": "Persist a coaching note or dialogue turn to the local coach_memory store (and, if the Cloudflare tunnel is up, sync it to D1/KV so it's cross-session visible remotely too).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "hero": {"type": "string", "description": "Hero this note is about (e.g. 'jdwalka', 'Gboss101')"},
+                                "kind": {"type": "string", "description": "Type of entry, e.g. 'note' or 'turn'", "default": "note"},
+                                "user_text": {"type": "string", "description": "The user-side text (question, hand context, etc.)"},
+                                "assistant_text": {"type": "string", "description": "The coaching note / observation to persist"},
+                                "provider": {"type": "string", "description": "Which agent wrote this: 'claude' or 'grok'"}
+                            },
+                            "required": ["hero", "assistant_text", "provider"]
+                        }
+                    },
+                    {
+                        "name": "d1_coach_memory",
+                        "description": "Read coach_memory dialogue history for a hero (cross-session coaching context) from the local coach_memory store.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "hero": {"type": "string", "description": "Hero name filter"},
+                                "limit": {"type": "integer", "description": "Max entries to return (default 20)"}
                             }
                         }
                     },
@@ -571,16 +728,18 @@ def handle_request(req):
                 query = args.get("query", "")
                 limit = min(args.get("limit", 10), 100)
                 offset = args.get("offset", 0)
+                gap_minutes = args.get("gap_minutes", 30)
                 where_str, sql_params, parsed_limit = parse_natural_language_query(query)
                 if not args.get("limit"):
                     limit = parsed_limit
-                sql = f"SELECT * FROM hands{where_str} ORDER BY date DESC LIMIT ? OFFSET ?"
+                sql = f"{session_id_cte(gap_minutes)} SELECT * FROM session_hands{where_str} ORDER BY date DESC LIMIT ? OFFSET ?"
                 hands = query_and_serialize_hands(db, settings, sql, sql_params + [limit, offset])
                 return json_rpc_success(req_id, {"hands": hands})
 
             elif tool_name == "get_recent_hands":
                 limit = min(args.get("limit", 10), 100)
                 since = args.get("since")
+                gap_minutes = args.get("gap_minutes", 30)
                 where_clauses = []
                 sql_params = []
                 if since:
@@ -589,7 +748,7 @@ def handle_request(req):
                 where_str = ""
                 if where_clauses:
                     where_str = " WHERE " + " AND ".join(where_clauses)
-                sql = f"SELECT * FROM hands{where_str} ORDER BY date DESC LIMIT ?"
+                sql = f"{session_id_cte(gap_minutes)} SELECT * FROM session_hands{where_str} ORDER BY date DESC LIMIT ?"
                 hands = query_and_serialize_hands(db, settings, sql, sql_params + [limit])
                 return json_rpc_success(req_id, {"hands": hands})
 
@@ -651,6 +810,49 @@ def handle_request(req):
                 )
                 return json_rpc_success(req_id, {"success": True, "found": True, "result": detail, "hand": detail})
 
+            elif tool_name == "get_hand_by_number":
+                hand_number = args.get("hand_number")
+                if not hand_number:
+                    return json_rpc_error(req_id, -32602, "hand_number is required")
+                gap_minutes = args.get("gap_minutes", 30)
+                lookup = db.get_hand_by_number(
+                    hand_number,
+                    site=args.get("site"),
+                    tournament_id=args.get("tournament_id"),
+                )
+                if lookup["matches"] == 1:
+                    detail = serialize_hand(
+                        lookup["hand"],
+                        settings,
+                        format=args.get("format", "full"),
+                        include_raw=bool(args.get("include_raw", True)),
+                    )
+                    with db.lock:
+                        conn = db._connect()
+                        try:
+                            conn.row_factory = sqlite3.Row
+                            sid_row = conn.execute(
+                                f"{session_id_cte(gap_minutes)} SELECT session_id FROM session_hands WHERE hand_id = ?",
+                                [lookup["hand"].hand_id],
+                            ).fetchone()
+                            detail["session_id"] = sid_row["session_id"] if sid_row else None
+                        finally:
+                            conn.close()
+                    return json_rpc_success(req_id, {"success": True, "found": True, "hand": detail})
+                if lookup["matches"] == 0:
+                    site_note = f" on site {args.get('site')}" if args.get("site") else ""
+                    return json_rpc_success(req_id, {
+                        "success": False,
+                        "found": False,
+                        "error": f"No hand found with hand_number {hand_number}{site_note}",
+                    })
+                return json_rpc_success(req_id, {
+                    "success": False,
+                    "found": False,
+                    "error": f"{lookup['matches']} hands match hand_number {hand_number} — disambiguate with site and/or tournament_id",
+                    "candidates": lookup["candidates"],
+                })
+
             elif tool_name == "add_tag":
                 hand_id = args.get("hand_id")
                 tag = args.get("tag")
@@ -669,6 +871,69 @@ def handle_request(req):
                 limit = min(args.get("limit", 10), 100)
                 sessions = calculate_sessions(db, settings, site=site, gap_minutes=gap_minutes, limit=limit)
                 return json_rpc_success(req_id, {"sessions": sessions})
+
+            elif tool_name == "get_live_table_read":
+                live = get_live_table_state(db, settings, site=args.get("site"), table=args.get("table"))
+                opponents_read = []
+                if live.get("hand_id"):
+                    with db.lock:
+                        conn = db._connect()
+                        try:
+                            conn.row_factory = sqlite3.Row
+                            for name in live.get("opponents", []):
+                                row = conn.execute(
+                                    "SELECT name, site, hands, vpip, pfr, af, fold_cbet, wtsd, three_bet, updated_at "
+                                    "FROM player_types WHERE lower(name) = lower(?)",
+                                    (name,),
+                                ).fetchone()
+                                opponents_read.append(
+                                    {**dict(row), "found": True} if row else {"name": name, "found": False}
+                                )
+                        finally:
+                            conn.close()
+                live["opponents_read"] = opponents_read
+                return json_rpc_success(req_id, live)
+
+            elif tool_name == "write_coach_memory":
+                hero = (args.get("hero") or "").strip()
+                assistant_text = (args.get("assistant_text") or "").strip()
+                provider = (args.get("provider") or "").strip()
+                kind = args.get("kind") or "note"
+                user_text = args.get("user_text") or ""
+                if not hero:
+                    return json_rpc_error(req_id, -32602, "hero is required")
+                if not assistant_text:
+                    return json_rpc_error(req_id, -32602, "assistant_text is required")
+                if not provider:
+                    return json_rpc_error(req_id, -32602, "provider is required (e.g. 'claude' or 'grok')")
+                mem = CoachMemory()
+                if kind == "turn":
+                    mem.add_turn(hero, user_text, assistant_text, provider=provider)
+                else:
+                    mem.add_note(hero, assistant_text, kind=kind, provider=provider)
+                return json_rpc_success(req_id, {"success": True, "hero": hero, "kind": kind, "provider": provider})
+
+            elif tool_name == "d1_coach_memory":
+                hero = (args.get("hero") or "").strip()
+                limit = min(args.get("limit", 20), 100)
+                conn = sqlite3.connect(DEFAULT_MEMORY_DB, timeout=10)
+                conn.row_factory = sqlite3.Row
+                try:
+                    cols = "id, hero, kind, user_text, assistant_text, provider, created_at"
+                    if hero:
+                        rows = conn.execute(
+                            f"SELECT {cols} FROM coach_memory WHERE lower(hero) LIKE lower(?) "
+                            "ORDER BY created_at DESC LIMIT ?",
+                            (f"%{hero}%", limit),
+                        ).fetchall()
+                    else:
+                        rows = conn.execute(
+                            f"SELECT {cols} FROM coach_memory ORDER BY created_at DESC LIMIT ?",
+                            (limit,),
+                        ).fetchall()
+                    return json_rpc_success(req_id, {"memories": [dict(r) for r in rows]})
+                finally:
+                    conn.close()
 
             elif tool_name == "run_network_command":
                 cmd = args.get("command")

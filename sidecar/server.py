@@ -689,7 +689,7 @@ def live_current_hand(
     for seat, info in sorted(hand.players.items()):
         name = str(info.get("name") or "").strip()
         is_hero = bool(info.get("is_hero")) or name in heroes
-        seat_map[str(seat)] = {"name": name, "is_hero": is_hero}
+        seat_map[str(seat)] = {"name": name, "is_hero": is_hero, "stack": info.get("stack")}
         if name and not is_hero:
             opponents.append(name)
 

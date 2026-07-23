@@ -40,7 +40,7 @@ const OPENAPI = {
   servers: [{ url: "https://leaksnipe-data-api.gitgoin87.workers.dev" }],
   paths: {
     "/v1/summary": { get: { operationId: "getDatabaseSummary", summary: "Get the overall hand database summary", responses: { "200": { description: "Summary" } } } },
-    "/v1/hands": { get: { operationId: "listHands", summary: "List recent hands, optionally filtered by hero name or date", parameters: [{ name: "limit", in: "query", schema: { type: "integer", maximum: 100 } }, { name: "hero", in: "query", schema: { type: "string" } }, { name: "start", in: "query", schema: { type: "string" } }, { name: "end", in: "query", schema: { type: "string" } }], responses: { "200": { description: "Hands" } } } },
+    "/v1/hands": { get: { operationId: "listHands", summary: "List recent hands, optionally filtered by hero name, date, or hand_number", parameters: [{ name: "limit", in: "query", schema: { type: "integer", maximum: 100 } }, { name: "hero", in: "query", schema: { type: "string" } }, { name: "start", in: "query", schema: { type: "string" } }, { name: "end", in: "query", schema: { type: "string" } }, { name: "hand_number", in: "query", schema: { type: "string" }, description: "Filter to a single hand_number, e.g. '96'" }], responses: { "200": { description: "Hands" } } } },
     "/v1/hands/{handId}": { get: { operationId: "getHand", summary: "Get one hand with actions and results", parameters: [{ name: "handId", in: "path", required: true, schema: { type: "string" } }], responses: { "200": { description: "Hand detail" }, "404": { description: "Not found" } } } },
     "/v1/players/{name}": { get: { operationId: "getPlayerStats", summary: "Get HUD statistics for a player", parameters: [{ name: "name", in: "path", required: true, schema: { type: "string" } }], responses: { "200": { description: "Player statistics" }, "404": { description: "Not found" } } } },
   },
@@ -68,11 +68,13 @@ export default {
       const hero = url.searchParams.get("hero")?.trim() || null;
       const start = url.searchParams.get("start")?.trim() || null;
       const end = url.searchParams.get("end")?.trim() || null;
+      const handNumber = url.searchParams.get("hand_number")?.trim() || null;
       const result = await env.DB.prepare(`SELECT h.hand_id, h.site, h.date, h.game_type, h.table_name,
           h.hero_cards, h.board_cards, h.hero_won, h.hero_position, h.pot, h.is_tournament
         FROM hands h WHERE (? IS NULL OR EXISTS (SELECT 1 FROM players p WHERE p.hand_id = h.hand_id AND p.is_hero = 1 AND lower(p.name) = lower(?)))
           AND (? IS NULL OR h.date >= ?) AND (? IS NULL OR h.date <= ?)
-        ORDER BY h.date DESC LIMIT ?`).bind(hero, hero, start, start, end, end, limit).run();
+          AND (? IS NULL OR h.hand_number = ?)
+        ORDER BY h.date DESC LIMIT ?`).bind(hero, hero, start, start, end, end, handNumber, handNumber, limit).run();
       return json({ hands: result.results, count: result.results.length });
     }
 

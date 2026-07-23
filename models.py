@@ -455,6 +455,60 @@ class HandDatabase:
             finally:
                 conn.close()
 
+    def get_hand_by_number(
+        self,
+        hand_number: str,
+        site: Optional[str] = None,
+        tournament_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Look up hand(s) by hand_number, optionally disambiguated by site/tournament_id.
+
+        Returns {"hand": Hand, "matches": 1} on a unique hit, or
+        {"hand": None, "matches": N, "candidates": [...]} when 0 or >1 rows match,
+        since hand_number alone is not globally unique across sites/tournaments.
+        """
+        with self.lock:
+            conn = self._connect()
+            try:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                where = ["hand_number = ?"]
+                params: List[Any] = [str(hand_number)]
+                if site:
+                    where.append("site = ?")
+                    params.append(site)
+                if tournament_id:
+                    where.append("tournament_id = ?")
+                    params.append(str(tournament_id))
+                rows = c.execute(
+                    f"SELECT * FROM hands WHERE {' AND '.join(where)} ORDER BY date DESC",
+                    params,
+                ).fetchall()
+                if len(rows) == 1:
+                    hand_ids = [rows[0]["hand_id"]]
+                    players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand = (
+                        self._load_related_for_ids(c, hand_ids)
+                    )
+                    hand = self._hydrate_hand(
+                        rows[0], players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand
+                    )
+                    return {"hand": hand, "matches": 1}
+                return {
+                    "hand": None,
+                    "matches": len(rows),
+                    "candidates": [
+                        {
+                            "hand_id": r["hand_id"],
+                            "site": r["site"],
+                            "tournament_id": r["tournament_id"],
+                            "date": r["date"],
+                        }
+                        for r in rows
+                    ],
+                }
+            finally:
+                conn.close()
+
     def search_hands(
         self,
         site: Optional[str] = None,

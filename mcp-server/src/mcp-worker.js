@@ -2985,6 +2985,51 @@ server.registerTool('tauri_db_player_stats', {
   return { player, found: true, ...player_row, by_position };
 });
 
+server.registerTool('get_live_table_read', {
+  description: 'Live read on the current table: seats/last-known stacks from the most recently imported hand, plus career VPIP/PFR/AF/WTSD/3-bet for every opponent currently seated. Note: hand histories only land after a hand completes, so this reflects the latest completed hand, not a mid-hand snapshot — stacks are that hand\'s starting stacks, not this instant\'s.',
+  properties: {
+    site: { type: 'string', description: 'Optional site filter (e.g. "BetACR", "CoinPoker")' },
+    table: { type: 'string', description: 'Optional table name/tournament_id filter' }
+  },
+  required: []
+}, async (args, env) => {
+  const { site, table } = args || {};
+  const qs = new URLSearchParams();
+  if (site) qs.set('site', site);
+  if (table) qs.set('table', table);
+  const path = '/api/live/current-hand' + (qs.toString() ? `?${qs.toString()}` : '');
+
+  const resp = await fetch('https://db.leaksnipe.win' + path, { headers: dbProxyHeaders(env) });
+  if (!resp.ok) throw new Error('Live table lookup failed: ' + resp.status + ' ' + await resp.text());
+  const live = await resp.json();
+
+  if (!live.hand_id) {
+    return { ...live, opponents_read: [] };
+  }
+
+  const dbQuery = async (sql, params) => {
+    const r = await fetch('https://db.leaksnipe.win/query', {
+      method: 'POST',
+      headers: dbProxyHeaders(env),
+      body: JSON.stringify({ sql, params }),
+    });
+    if (!r.ok) throw new Error('DB query failed: ' + r.status);
+    return r.json();
+  };
+
+  const opponents_read = [];
+  for (const name of live.opponents || []) {
+    const career = await dbQuery(
+      'SELECT name, site, hands, vpip, pfr, af, fold_cbet, wtsd, three_bet, updated_at FROM player_types WHERE lower(name) = lower(?)',
+      [name]
+    );
+    const row = (career.results || [])[0];
+    opponents_read.push(row ? { name, found: true, ...row } : { name, found: false });
+  }
+
+  return { ...live, opponents_read };
+});
+
 server.registerTool('tauri_db_hands', {
   description: 'Get recent hands from the Tauri DB with optional filters',
   properties: { player: { type: 'string' }, game_type: { type: 'string' }, limit: { type: 'number' } },
@@ -3048,6 +3093,37 @@ async function d1QueryViaProxy(env, sql, params = []) {
   return await queryDatabase(env, sql, params);
 }
 
+// A CTE that tags every row in `hands` with a computed session_id — a per-site sit-down
+// grouping using the same gap-based heuristic as get_sessions_winrate (default 30min gap).
+// The window function MUST run over the full, unfiltered hand history per site (LAG needs
+// the true previous hand's date) — any caller-supplied WHERE filter has to be applied
+// *outside* this CTE, never folded into it, or the gap calculation silently breaks
+// (windowing over an already-filtered subset produces a meaningless session_id — e.g.
+// everything collapses to 1). Computed at query time, not persisted.
+//
+// Split into two CTE steps (gaps, then session_hands) rather than nesting LAG() directly
+// inside SUM()'s argument — SQLite rejects a window function used as an input expression
+// to another window function in the same SELECT ("misuse of window function LAG()").
+// This bit the pre-existing get_sessions_winrate query too (verified against sqlite3
+// 3.45.1 locally); that one's out of scope here, but worth fixing separately.
+function sessionIdCte(gapMinutes = 30) {
+  const gm = Math.min(Math.max(Number(gapMinutes) || 30, 1), 1440);
+  return `
+    WITH gaps AS (
+      SELECT h.*,
+        LAG(h.date) OVER (PARTITION BY h.site ORDER BY h.date) AS prev_date
+      FROM hands h
+    ),
+    session_hands AS (
+      SELECT *,
+        SUM(CASE WHEN
+          prev_date IS NULL OR (julianday(date) - julianday(prev_date)) * 24 * 60 > ${gm}
+        THEN 1 ELSE 0 END) OVER (PARTITION BY site ORDER BY date) AS session_id
+      FROM gaps
+    )
+  `;
+}
+
 // Helper for parsing card patterns like "QQ", "AKs", etc.
 function parseCardPattern(term) {
   if (!term) return null;
@@ -3091,24 +3167,61 @@ function parseCardPattern(term) {
   return null;
 }
 
+server.registerTool('get_hand_by_number', {
+  description: 'Get exactly one hand by its hand_number (reliable single-hand lookup — use this instead of get_hand_history/search_hands when you know the hand number). Pass site and/or tournament_id to disambiguate if the same hand_number appears more than once. Includes a computed session_id grouping the hand with its sit-down.',
+  properties: {
+    hand_number: { type: 'string', description: 'The hand_number to look up, e.g. "96"' },
+    site: { type: 'string', description: 'Optional site filter to disambiguate (e.g. "BetACR", "CoinPoker")' },
+    tournament_id: { type: 'string', description: 'Optional tournament_id filter to disambiguate' },
+    gap_minutes: { type: 'number', description: 'Session-boundary gap in minutes for the computed session_id', default: 30 }
+  },
+  required: ['hand_number']
+}, async (args, env) => {
+  const { hand_number, site, tournament_id, gap_minutes = 30 } = args;
+  if (!hand_number) throw new Error('hand_number is required');
+
+  let where = 'WHERE hand_number = ?';
+  const params = [String(hand_number)];
+  if (site) { where += ' AND site = ?'; params.push(site); }
+  if (tournament_id) { where += ' AND tournament_id = ?'; params.push(String(tournament_id)); }
+
+  const sql = `${sessionIdCte(gap_minutes)} SELECT * FROM session_hands ${where}`;
+  const result = await queryDatabase(env, sql, params);
+  const rows = result.results || [];
+
+  if (rows.length === 1) return { success: true, hand: rows[0] };
+  if (rows.length === 0) {
+    return {
+      success: false,
+      error: `No hand found with hand_number ${hand_number}` + (site ? ` on site ${site}` : ''),
+    };
+  }
+  return {
+    success: false,
+    error: `${rows.length} hands match hand_number ${hand_number} — disambiguate with site and/or tournament_id`,
+    candidates: rows.map(r => ({ hand_id: r.hand_id, site: r.site, tournament_id: r.tournament_id, date: r.date })),
+  };
+});
+
 server.registerTool('get_recent_hands', {
   description: 'Returns the most recent hands played by the user',
   properties: {
     limit: { type: 'number', description: 'Maximum number of hands to return', default: 10 },
-    since: { type: 'string', description: 'ISO timestamp or date string to get hands after' }
+    since: { type: 'string', description: 'ISO timestamp or date string to get hands after' },
+    gap_minutes: { type: 'number', description: 'Session-boundary gap in minutes for the computed session_id', default: 30 }
   },
   required: []
 }, async (args, env) => {
-  const { limit = 10, since } = args || {};
-  let sql = 'SELECT * FROM hands WHERE 1=1';
+  const { limit = 10, since, gap_minutes = 30 } = args || {};
+  let where = 'WHERE 1=1';
   const params = [];
   if (since) {
-    sql += ' AND date > ?';
+    where += ' AND date > ?';
     params.push(since);
   }
-  sql += ' ORDER BY date DESC LIMIT ?';
-  params.push(limit);
 
+  const sql = `${sessionIdCte(gap_minutes)} SELECT * FROM session_hands ${where} ORDER BY date DESC LIMIT ?`;
+  params.push(limit);
   return await queryDatabase(env, sql, params);
 });
 
@@ -3179,52 +3292,53 @@ server.registerTool('get_hands_by_position', {
 });
 
 server.registerTool('search_hands', {
-  description: 'Search hands using natural keywords (e.g. "BTN", "won", "tournament", "QQ", tag names)',
+  description: 'Search hands using natural keywords (e.g. "BTN", "won", "tournament", "QQ", tag names). Note: for a specific hand_number, prefer get_hand_by_number, which guarantees a single unambiguous result.',
   properties: {
     query: { type: 'string', description: 'Search keywords like "BTN won QQ", "bluff", "NL50"' },
-    limit: { type: 'number', description: 'Maximum number of hands to return', default: 10 }
+    limit: { type: 'number', description: 'Maximum number of hands to return', default: 10 },
+    gap_minutes: { type: 'number', description: 'Session-boundary gap in minutes for the computed session_id', default: 30 }
   },
   required: ['query']
 }, async (args, env) => {
-  const { query, limit = 10 } = args;
-  let sql = 'SELECT * FROM hands WHERE 1=1';
+  const { query, limit = 10, gap_minutes = 30 } = args;
+  let where = 'WHERE 1=1';
   const params = [];
   const terms = query.toLowerCase().replace(/[^a-z0-9\s><=-]/g, '').split(/\s+/).filter(Boolean);
 
   for (const term of terms) {
     if (['btn', 'sb', 'bb', 'co', 'mp', 'ep', 'utg'].includes(term)) {
-      sql += ' AND UPPER(hero_position) = ?';
+      where += ' AND UPPER(hero_position) = ?';
       params.push(term.toUpperCase());
       continue;
     }
     if (['won', 'win', 'winning'].includes(term)) {
-      sql += ' AND hero_won > 0';
+      where += ' AND hero_won > 0';
       continue;
     }
     if (['lost', 'lose', 'losing'].includes(term)) {
-      sql += ' AND hero_won < 0';
+      where += ' AND hero_won < 0';
       continue;
     }
     if (['tournament', 'tourney', 'mtt'].includes(term)) {
-      sql += ' AND is_tournament = 1';
+      where += ' AND is_tournament = 1';
       continue;
     }
     if (['cash', 'ring'].includes(term)) {
-      sql += ' AND is_tournament = 0';
+      where += ' AND is_tournament = 0';
       continue;
     }
     const cardPattern = parseCardPattern(term);
     if (cardPattern) {
-      sql += ` AND ${cardPattern.sql}`;
+      where += ` AND ${cardPattern.sql}`;
       params.push(...cardPattern.params);
       continue;
     }
-    sql += ' AND (hand_id IN (SELECT hand_id FROM hand_tags WHERE LOWER(tag) LIKE ?) OR LOWER(source_file) LIKE ? OR LOWER(table_name) LIKE ? OR hand_number = ?)';
+    where += ' AND (hand_id IN (SELECT hand_id FROM hand_tags WHERE LOWER(tag) LIKE ?) OR LOWER(source_file) LIKE ? OR LOWER(table_name) LIKE ? OR hand_number = ?)';
     const likeVal = '%' + term + '%';
     params.push(likeVal, likeVal, likeVal, term);
   }
 
-  sql += ' ORDER BY date DESC LIMIT ?';
+  const sql = `${sessionIdCte(gap_minutes)} SELECT * FROM session_hands ${where} ORDER BY date DESC LIMIT ?`;
   params.push(limit);
 
   return await queryDatabase(env, sql, params);
@@ -3515,6 +3629,41 @@ server.registerTool('d1_coach_memory', {
   } catch (e) {
     return { memories: [], error: e.message, hint: 'Run D1 migration 0002_coaching_tables.sql and re-export coach_memory.db' };
   }
+});
+
+server.registerTool('write_coach_memory', {
+  description: 'Persist a coaching note or dialogue turn back to Cloudflare (D1 coach_memory table + AI_INSIGHTS KV) so it is durable and immediately visible cross-session via d1_coach_memory. Use this to save coaching observations taken during this session.',
+  properties: {
+    hero: { type: 'string', description: 'Hero this note is about (e.g. "jdwalka", "Gboss101")' },
+    kind: { type: 'string', description: 'Type of entry, e.g. "note" or "turn"', default: 'note' },
+    user_text: { type: 'string', description: 'The user-side text (question, hand context, etc.)' },
+    assistant_text: { type: 'string', description: 'The coaching note / observation to persist' },
+    provider: { type: 'string', description: 'Which agent wrote this: "claude" or "grok"' },
+  },
+  required: ['hero', 'assistant_text', 'provider'],
+}, async (args, env) => {
+  const hero = String(args.hero || '').trim();
+  const kind = String(args.kind || 'note');
+  const user_text = args.user_text != null ? String(args.user_text) : '';
+  const assistant_text = String(args.assistant_text || '').trim();
+  const provider = String(args.provider || '').trim();
+  if (!hero) throw new Error('hero is required');
+  if (!assistant_text) throw new Error('assistant_text is required');
+  if (!provider) throw new Error('provider is required (e.g. "claude" or "grok")');
+
+  const created_at = new Date().toISOString();
+
+  if (!env.DB) throw new Error('D1 binding DB not configured on this worker');
+  await env.DB.prepare(
+    'INSERT INTO coach_memory (hero, kind, user_text, assistant_text, provider, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+  ).bind(hero, kind, user_text, assistant_text, provider, created_at).run();
+
+  if (env.AI_INSIGHTS) {
+    const key = `note:${hero}:${created_at}`;
+    await env.AI_INSIGHTS.put(key, JSON.stringify({ hero, kind, user_text, assistant_text, provider, created_at }));
+  }
+
+  return { success: true, hero, kind, provider, created_at };
 });
 
 server.registerTool('d1_database_summary', {

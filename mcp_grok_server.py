@@ -25,6 +25,7 @@ try:
     from models import HandDatabase, Hand
     from config import load_settings
     from utils import resolve_hand_hero_name
+    from coach_memory import CoachMemory
 except Exception as e:
     sys.stderr.write(f"[LeakSnipe-Grok] Imports failed: {e}\n")
     sys.stderr.flush()
@@ -263,6 +264,38 @@ def parse_natural_language_query(query: str) -> tuple[str, list, int]:
     return where_str, params, limit
 
 
+def session_id_cte(gap_minutes: int = 30) -> str:
+    """A CTE that tags every row in `hands` with a computed session_id — a per-site
+    sit-down grouping using the same gap-based heuristic as get_sessions_winrate below.
+    Must run over the FULL, unfiltered hand history per site (LAG needs the true previous
+    hand's date) — any caller-supplied filter has to be applied outside this CTE
+    (`SELECT * FROM session_hands WHERE ...`), never folded into it, or the gap
+    calculation silently breaks (windowing over an already-filtered subset collapses
+    everything into session_id=1). Computed at query time, not persisted.
+
+    Split into two CTE steps (gaps, then session_hands) rather than nesting LAG()
+    directly inside SUM()'s argument — SQLite rejects a window function used as an
+    input expression to another window function in the same SELECT ("misuse of window
+    function LAG()"), verified against sqlite3 3.45.1 locally. get_sessions_winrate
+    below has this same nested pattern and hits the same error — out of scope here,
+    but worth fixing separately."""
+    gm = min(max(int(gap_minutes or 30), 1), 1440)
+    return f"""
+        WITH gaps AS (
+            SELECT h.*,
+                LAG(h.date) OVER (PARTITION BY h.site ORDER BY h.date) AS prev_date
+            FROM hands h
+        ),
+        session_hands AS (
+            SELECT *,
+                SUM(CASE WHEN
+                    prev_date IS NULL OR (julianday(date) - julianday(prev_date)) * 24 * 60 > {gm}
+                THEN 1 ELSE 0 END) OVER (PARTITION BY site ORDER BY date) AS session_id
+            FROM gaps
+        )
+    """
+
+
 def query_and_serialize_hands(db, settings, sql, params):
     with db.lock:
         conn = db._connect()
@@ -273,6 +306,11 @@ def query_and_serialize_hands(db, settings, sql, params):
             if not rows:
                 return []
             hand_ids = [row["hand_id"] for row in rows]
+            session_ids = {
+                row["hand_id"]: row["session_id"]
+                for row in rows
+                if "session_id" in row.keys()
+            }
             players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand = (
                 db._load_related_for_ids(c, hand_ids)
             )
@@ -282,7 +320,11 @@ def query_and_serialize_hands(db, settings, sql, params):
                 )
                 for row in rows
             ]
-            return [serialize_hand(h, settings) for h in hands]
+            serialized = [serialize_hand(h, settings) for h in hands]
+            if session_ids:
+                for s in serialized:
+                    s["session_id"] = session_ids.get(s.get("hand_id"))
+            return serialized
         finally:
             conn.close()
 
@@ -564,9 +606,183 @@ def list_coach_memory(hero: Optional[str] = None, limit: int = 20) -> List[Dict[
 
 
 @mcp.tool()
+def write_coach_memory(
+    hero: str,
+    assistant_text: str,
+    provider: str,
+    kind: str = "note",
+    user_text: str = "",
+) -> Dict[str, Any]:
+    """Persist a coaching note or dialogue turn to coach_memory (creates the DB/table on
+    first use). Use this to save coaching observations taken during this session.
+
+    Args:
+        hero: Hero this note is about (e.g. 'jdwalka', 'Gboss101').
+        assistant_text: The coaching note / observation to persist.
+        provider: Which agent wrote this: 'claude' or 'grok'.
+        kind: Type of entry, e.g. 'note' or 'turn' (default 'note').
+        user_text: The user-side text (question, hand context, etc.), for kind='turn'.
+    """
+    hero = (hero or "").strip()
+    assistant_text = (assistant_text or "").strip()
+    provider = (provider or "").strip()
+    if not hero:
+        raise ValueError("hero is required")
+    if not assistant_text:
+        raise ValueError("assistant_text is required")
+    if not provider:
+        raise ValueError("provider is required (e.g. 'claude' or 'grok')")
+    mem = CoachMemory()
+    if kind == "turn":
+        mem.add_turn(hero, user_text, assistant_text, provider=provider)
+    else:
+        mem.add_note(hero, assistant_text, kind=kind, provider=provider)
+    return {"success": True, "hero": hero, "kind": kind, "provider": provider}
+
+
+@mcp.tool()
+def get_live_table_read(
+    site: Optional[str] = None,
+    table: Optional[str] = None,
+    database: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Live read on the current table: seats/last-known stacks from the most recently
+    imported hand, plus career VPIP/PFR/AF/WTSD/3-bet for every opponent currently seated.
+    Note: hand histories only land after a hand completes, so this reflects the latest
+    completed hand, not a mid-hand snapshot.
+
+    Args:
+        site: Optional site filter (e.g. 'BetACR', 'CoinPoker').
+        table: Optional table name/tournament_id filter.
+        database: Optional database name (default: poker_hands).
+    """
+    settings = load_settings()
+    db = HandDatabase(str(_resolve_db(database)))
+
+    heroes = set()
+    for aliases in (settings.get("hero_names") or {}).values():
+        for alias in str(aliases).split(","):
+            alias = alias.strip()
+            if alias:
+                heroes.add(alias)
+
+    hands = db.get_hands_page(50, 0)
+    hand = None
+    site_filter = (site or "").strip()
+    table_filter = (table or "").strip().lower()
+    if table_filter == "coinpoker":
+        table_filter = ""
+    for h in hands:
+        if site_filter and h.site.lower() != site_filter.lower():
+            continue
+        if table_filter:
+            h_table = (h.table_name or "").strip().lower()
+            h_tid = str(h.tournament_id or "").strip().lower()
+            if table_filter not in h_table and h_table not in table_filter and table_filter != h_tid:
+                continue
+        hand = h
+        break
+    if hand is None and site_filter:
+        for h in hands:
+            if h.site.lower() == site_filter.lower():
+                hand = h
+                break
+    if hand is None and hands:
+        hand = hands[0]
+
+    if not hand:
+        return {
+            "ok": True, "hand_id": None, "site": None, "max_seats": 6,
+            "seat_map": {}, "opponents": [], "table_name": None, "opponents_read": [],
+        }
+
+    seat_map = {}
+    opponents = []
+    for seat, info in sorted(hand.players.items()):
+        name = str(info.get("name") or "").strip()
+        is_hero = bool(info.get("is_hero")) or name in heroes
+        seat_map[str(seat)] = {"name": name, "is_hero": is_hero, "stack": info.get("stack")}
+        if name and not is_hero:
+            opponents.append(name)
+
+    opponents_read = []
+    with db.lock:
+        conn = db._connect()
+        try:
+            conn.row_factory = sqlite3.Row
+            for name in opponents:
+                row = conn.execute(
+                    "SELECT name, site, hands, vpip, pfr, af, fold_cbet, wtsd, three_bet, updated_at "
+                    "FROM player_types WHERE lower(name) = lower(?)",
+                    (name,),
+                ).fetchone()
+                opponents_read.append({**dict(row), "found": True} if row else {"name": name, "found": False})
+        finally:
+            conn.close()
+
+    return {
+        "ok": True,
+        "hand_id": hand.hand_id,
+        "site": hand.site,
+        "max_seats": hand.max_seats or 6,
+        "seat_map": seat_map,
+        "opponents": opponents,
+        "table_name": hand.table_name,
+        "opponents_read": opponents_read,
+    }
+
+
+@mcp.tool()
+def get_hand_by_number(
+    hand_number: str,
+    site: Optional[str] = None,
+    tournament_id: Optional[str] = None,
+    gap_minutes: int = 30,
+    database: Optional[str] = None
+) -> Dict[str, Any]:
+    """Get exactly one hand by its hand_number (reliable single-hand lookup — prefer this
+    over search_hands when you know the hand number, not the internal hand_id).
+
+    Args:
+        hand_number: The hand_number to look up, e.g. '96'.
+        site: Optional site filter to disambiguate (e.g. 'BetACR', 'CoinPoker').
+        tournament_id: Optional tournament_id filter to disambiguate.
+        gap_minutes: Session-boundary gap in minutes for the computed session_id (default 30).
+        database: Optional database name (default: poker_hands).
+    """
+    settings = load_settings()
+    db = HandDatabase(str(_resolve_db(database)))
+    lookup = db.get_hand_by_number(hand_number, site=site, tournament_id=tournament_id)
+    if lookup["matches"] == 1:
+        detail = serialize_hand(lookup["hand"], settings)
+        with db.lock:
+            conn = db._connect()
+            try:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    f"{session_id_cte(gap_minutes)} SELECT session_id FROM session_hands WHERE hand_id = ?",
+                    [lookup["hand"].hand_id],
+                ).fetchone()
+                detail["session_id"] = row["session_id"] if row else None
+            finally:
+                conn.close()
+        return {"success": True, "found": True, "hand": detail}
+    if lookup["matches"] == 0:
+        site_note = f" on site {site}" if site else ""
+        return {"success": False, "found": False, "error": f"No hand found with hand_number {hand_number}{site_note}"}
+    return {
+        "success": False,
+        "found": False,
+        "error": f"{lookup['matches']} hands match hand_number {hand_number} — disambiguate with site and/or tournament_id",
+        "candidates": lookup["candidates"],
+    }
+
+
+@mcp.tool()
 def get_recent_hands(
     limit: int = 10,
     since: Optional[str] = None,
+    gap_minutes: int = 30,
     database: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """Returns the most recent hands played by the user.
@@ -574,6 +790,7 @@ def get_recent_hands(
     Args:
         limit: Max hands to return (default 10).
         since: ISO timestamp YYYY-MM-DD to get hands after.
+        gap_minutes: Session-boundary gap in minutes for the computed session_id (default 30).
         database: Optional database name (default: poker_hands).
     """
     settings = load_settings()
@@ -586,7 +803,7 @@ def get_recent_hands(
     where_str = ""
     if where_clauses:
         where_str = " WHERE " + " AND ".join(where_clauses)
-    sql = f"SELECT * FROM hands{where_str} ORDER BY date DESC LIMIT ?"
+    sql = f"{session_id_cte(gap_minutes)} SELECT * FROM session_hands{where_str} ORDER BY date DESC LIMIT ?"
     return query_and_serialize_hands(db, settings, sql, sql_params + [limit])
 
 
@@ -684,21 +901,25 @@ def search_hands(
     query: str,
     limit: Optional[int] = None,
     offset: int = 0,
+    gap_minutes: int = 30,
     database: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """Natural language search across hands (e.g. 'my last 3-bet pot from cutoff').
+    Note: for a specific hand_number, prefer get_hand_by_number, which guarantees a
+    single unambiguous result.
 
     Args:
         query: Natural language search query.
         limit: Optional limit to override query limit.
         offset: Pagination offset.
+        gap_minutes: Session-boundary gap in minutes for the computed session_id (default 30).
         database: Optional database name (default: poker_hands).
     """
     settings = load_settings()
     db = HandDatabase(str(_resolve_db(database)))
     where_str, sql_params, parsed_limit = parse_natural_language_query(query)
     lim = limit if limit is not None else parsed_limit
-    sql = f"SELECT * FROM hands{where_str} ORDER BY date DESC LIMIT ? OFFSET ?"
+    sql = f"{session_id_cte(gap_minutes)} SELECT * FROM session_hands{where_str} ORDER BY date DESC LIMIT ? OFFSET ?"
     return query_and_serialize_hands(db, settings, sql, sql_params + [lim, offset])
 
 
