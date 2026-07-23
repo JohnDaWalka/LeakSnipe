@@ -4411,7 +4411,7 @@ export default {
     }
 
     // Handle MCP Server Request and inject universal CORS and Cache-Control headers
-    const mcpResponse = await server.handleRequest(request, env);
+    const mcpResponse = await server.handleRequest(request.clone(), env);
     const body = await mcpResponse.text();
     const respHeaders = new Headers();
     respHeaders.append('Content-Type', 'application/json');
