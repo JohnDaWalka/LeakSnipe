@@ -54,6 +54,15 @@ _COINPOKER_CAPTION_TO_ACTION = {
     "FOLD": "fold", "CHECK": "check", "CALL": "call",
     "BET": "bet", "RAISE": "raise", "ALLIN": "raise",
 }
+# Cash ring table names carry an explicit stakes notation, e.g.
+# "31st NL 0.05-0.10 EV-INRIT-(A) 948685" or "Eton PL 1-2 (Fast)". This is a
+# positive "this is a cash table" signal, distinct from tournament rooms
+# (which are named "<buy-in> <name> <tournament-id>", e.g.
+# "$2.20 Asia 6-Max Classic 1115916") — the trailing digits on a cash
+# table name are just a table number, never a tournament id.
+_COINPOKER_STAKES_RE = re.compile(
+    r"\b(?:NL|PL|FL)\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\b", re.IGNORECASE
+)
 
 
 def _parse_hand_datetime(dt_str: str, tz_suffix: str = "",
@@ -530,16 +539,29 @@ class HandParser:
         return f"{rank}{suit}"
 
     @staticmethod
-    def _coinpoker_parse_room(room_name: str) -> Tuple[str, str, str]:
+    def _coinpoker_parse_room(room_name: str) -> Tuple[str, str, str, bool]:
+        """Parse a CoinPoker room name into (tournament_id, buy_in, table_name, is_cash).
+
+        Returns is_cash=True when the name carries an explicit cash-stakes
+        notation (see _COINPOKER_STAKES_RE) — in that case tournament_id is
+        always "" regardless of any trailing digits in the name, since those
+        digits are a table number, not a tournament id.
+        """
         room = (room_name or "").strip()
         if not room:
-            return "", "", ""
+            return "", "", "", False
         match = re.search(r"^[₮$€]?(\d+(?:\.\d+)?)\s+(.+?)\s+(\d+)$", room)
         if match:
-            return match.group(3), f"{match.group(1)}+0", room
-        table_match = re.search(r"(\d+)\s*$", room)
-        table_id = table_match.group(1) if table_match else ""
-        return table_id, "", room
+            return match.group(3), f"{match.group(1)}+0", room, False
+        stakes = _COINPOKER_STAKES_RE.search(room)
+        if stakes:
+            return "", f"{stakes.group(1)}-{stakes.group(2)}", room, True
+        # No confident tournament- or cash-stakes signal in the name — don't
+        # guess a tournament_id from arbitrary trailing digits (that was the
+        # root cause of cash tables getting mislabeled as tournaments: most
+        # CoinPoker table names end in a numeric table id regardless of
+        # whether the table is cash or a tournament).
+        return "", "", room, False
 
     def _build_coinpoker_hand_from_events(
         self, events: List[Dict[str, Any]], hero: str,
@@ -605,12 +627,16 @@ class HandParser:
                         starting_stacks[player] = stack + amount
 
             if room and not h.table_name:
-                table_id, buy_in, table_name = self._coinpoker_parse_room(room)
+                table_id, buy_in, table_name, room_is_cash = self._coinpoker_parse_room(room)
                 h.table_name = table_name
                 if table_id:
                     h.tournament_id = table_id
                 if buy_in:
                     h.buy_in = buy_in
+                if room_is_cash:
+                    # Explicit cash-stakes notation in the table name overrides
+                    # any tournament default — see _coinpoker_parse_room.
+                    h.is_tournament = False
 
             if not h.hand_id:
                 hand_num = self._coinpoker_event_hand_key(bean)
@@ -629,12 +655,17 @@ class HandParser:
                 init = bean.get("gameInitResponseData") or {}
                 if not h.button_seat and init.get("dealerSeatId"):
                     h.button_seat = int(init.get("dealerSeatId") or 0)
-                if not h.tournament_id and init.get("tableId"):
-                    h.tournament_id = str(int(float(init.get("tableId"))))
                 room_props = bean.get("roomProperties") or init.get("roomProperties") or {}
                 game_type_str = str(room_props.get("gameType") or "").upper()
                 if game_type_str:
                     h.is_tournament = "RING" not in game_type_str and "CASH" not in game_type_str
+                # tableId is an internal table identifier present on cash and
+                # tournament tables alike — only treat it as a tournament_id
+                # once we actually believe this is a tournament (from the
+                # gameType check above, or from the room-name cash-stakes
+                # override in the room-parsing block), never blindly.
+                if not h.tournament_id and init.get("tableId") and h.is_tournament:
+                    h.tournament_id = str(int(float(init.get("tableId"))))
                 seat_block = (
                     bean.get("seatInfoRsponseData")
                     or bean.get("seatInfoResponseData")
@@ -962,11 +993,19 @@ class HandParser:
         """Parse CoinPoker hand history format."""
         h = Hand()
         h.site = "CoinPoker"
+        h.raw_text = text
         lines = text.split("\n")
         hero = self._resolve_hero(text, "CoinPoker")
 
         header = lines[0] if lines else ""
         m = re.search(r"CoinPoker Hand #(\d+)", header)
+        if not m:
+            # Our own synthetic re-export format (see
+            # _format_coinpoker_hand_text, used for JSON main.log-derived
+            # hands) writes "Hand #CP_<n> - ..." instead. Accept it too so
+            # reparse_hands_missing_hero can backfill stored raw_text for
+            # those hands instead of silently no-op'ing on every one of them.
+            m = re.search(r"Hand #(?:CP_)?(\d+)", header)
         if not m:
             return None
         h.hand_id = f"CP_{m.group(1)}"
@@ -997,6 +1036,25 @@ class HandParser:
         bm = re.search(r"Seat #(\d+) is the button", table_line)
         if bm:
             h.button_seat = int(bm.group(1))
+
+        if not tm:
+            # No explicit "Tournament #" marker in the header — true for
+            # both genuine cash hands and our own synthetic re-export text
+            # (which never carries one at all). Fall back to the same
+            # table-name heuristic the JSON main.log ingestion path uses,
+            # so cash tables aren't left with a stale/default tournament_id
+            # and genuine tournament tables (named "<buy-in> <name> <id>")
+            # still get classified correctly.
+            troom_id, troom_buyin, _, room_is_cash = self._coinpoker_parse_room(h.table_name)
+            if room_is_cash:
+                h.is_tournament = False
+                if troom_buyin and not h.buy_in:
+                    h.buy_in = troom_buyin
+            elif troom_id:
+                h.is_tournament = True
+                h.tournament_id = troom_id
+                if troom_buyin and not h.buy_in:
+                    h.buy_in = troom_buyin
 
         for line in lines:
             seat_m = re.match(r"Seat (\d+): (.+?) \((\d+(?:\.\d+)?) in chips\)", line.strip())

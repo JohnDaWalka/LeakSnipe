@@ -6,7 +6,7 @@ Defines Hand and HandDatabase classes for storing and retrieving hand data.
 import os
 import sqlite3
 import threading
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 from datetime import datetime
 from collections import defaultdict, OrderedDict
 import logging
@@ -202,28 +202,33 @@ class HandDatabase:
                 conn.close()
 
     def hand_needs_hero_backfill(self, hand_id: str) -> bool:
-        """True when stored hero cards or position are missing."""
+        """True when stored hero cards/position, or seat/button info, are missing."""
         with self.lock:
             conn = self._connect()
             try:
                 row = conn.execute(
-                    "SELECT hero_cards, hero_position FROM hands WHERE hand_id = ?",
+                    "SELECT hero_cards, hero_position, max_seats, button_seat "
+                    "FROM hands WHERE hand_id = ?",
                     (hand_id,),
                 ).fetchone()
                 if not row:
                     return False
                 cards = (row[0] or "").strip()
                 position = (row[1] or "").strip()
-                return not cards or not position or position == "?"
+                missing_hero = not cards or not position or position == "?"
+                missing_seats = not (row[2] or 0) or not (row[3] or 0)
+                return missing_hero or missing_seats
             finally:
                 conn.close()
 
     @staticmethod
     def hand_has_hero_fields(hand: Hand) -> bool:
-        """True when a parsed hand has usable hero cards and position."""
+        """True when a parsed hand has usable hero cards/position, or seat/button info."""
         cards = (hand.hero_cards or "").strip()
         position = (hand.hero_position or "").strip()
-        return bool(cards) and bool(position) and position != "?"
+        has_hero = bool(cards) and bool(position) and position != "?"
+        has_seats = bool(hand.max_seats) and bool(hand.button_seat)
+        return has_hero or has_seats
 
     def save_hand(self, hand: Hand, source_file: str = "") -> None:
         """Save a hand to the database."""
@@ -1034,6 +1039,121 @@ class HandDatabase:
                     SELECT * FROM tournament_summaries ORDER BY imported_at DESC
                 """)
                 return [dict(row) for row in cursor.fetchall()]
+            finally:
+                conn.close()
+
+    def get_tournament_hand_rollup(
+        self, site: Optional[str] = None, tournament_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Derive a tournament summary on demand from hands+players.
+
+        tournament_summaries is only ever populated by parsing WPN/BetACR
+        .ots result files (see importing.py) -- CoinPoker has no equivalent
+        export, so its tournaments never get a row there. This computes a
+        rollup straight from already-imported hand data instead, so it's
+        always fresh and needs no separate ingest pipeline.
+
+        This CANNOT know true finish_position or prize -- those are
+        cashier-level facts, not something a hand-history stream carries --
+        so both are always None here. What IS derived is what's actually
+        observable from hero's own hands in the tournament:
+          - hero_busted_out: hero's stack was 0 in their last hand for the
+            tournament (a real "did the run end in elimination" signal;
+            None when we simply don't know, e.g. the tournament may still
+            be in progress).
+          - tables_played / min_seated_on_last_table / likely_final_table:
+            a conservative, explicitly-labeled heuristic for whether hero
+            was still in when the field consolidated to a short-handed
+            table. This is NOT a certified "you made the final table" fact
+            -- callers must not present it as one.
+
+        Every row carries source="computed_from_hands" so callers never
+        confuse this with a real materialized tournament_summaries row.
+        """
+        with self.lock:
+            conn = self._connect()
+            try:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                where = ["is_tournament = 1", "tournament_id IS NOT NULL", "tournament_id != ''"]
+                params: List[Any] = []
+                if site:
+                    where.append("site = ?")
+                    params.append(site)
+                if tournament_id:
+                    where.append("tournament_id = ?")
+                    params.append(str(tournament_id))
+                rows = c.execute(
+                    f"SELECT hand_id, site, tournament_id, buy_in, table_name, date, hero_won "
+                    f"FROM hands WHERE {' AND '.join(where)} ORDER BY date ASC",
+                    params,
+                ).fetchall()
+                if not rows:
+                    return []
+
+                hand_ids = [r["hand_id"] for r in rows]
+                placeholders = ",".join("?" * len(hand_ids))
+                seat_counts: Dict[str, int] = {}
+                for prow in c.execute(
+                    f"SELECT hand_id, COUNT(*) AS n FROM players "
+                    f"WHERE hand_id IN ({placeholders}) GROUP BY hand_id",
+                    hand_ids,
+                ).fetchall():
+                    seat_counts[prow["hand_id"]] = int(prow["n"])
+                hero_stacks: Dict[str, float] = {}
+                for prow in c.execute(
+                    f"SELECT hand_id, stack FROM players "
+                    f"WHERE hand_id IN ({placeholders}) AND is_hero = 1",
+                    hand_ids,
+                ).fetchall():
+                    hero_stacks[prow["hand_id"]] = float(prow["stack"] or 0.0)
+
+                groups: Dict[Tuple[str, str], List[sqlite3.Row]] = {}
+                for r in rows:
+                    groups.setdefault((r["site"], r["tournament_id"]), []).append(r)
+
+                results: List[Dict[str, Any]] = []
+                for (grp_site, grp_tid), grp_rows in groups.items():
+                    buy_in = next((r["buy_in"] for r in grp_rows if r["buy_in"]), "")
+                    last_row = grp_rows[-1]
+                    last_table = last_row["table_name"] or ""
+                    tables_played = len({r["table_name"] for r in grp_rows if r["table_name"]})
+                    seated_on_last_table = [
+                        seat_counts[r["hand_id"]]
+                        for r in grp_rows
+                        if r["table_name"] == last_table and r["hand_id"] in seat_counts
+                    ]
+                    min_seated_on_last_table = (
+                        min(seated_on_last_table) if seated_on_last_table else None
+                    )
+                    hero_final_stack = hero_stacks.get(last_row["hand_id"])
+                    hero_busted_out = (
+                        hero_final_stack == 0.0 if hero_final_stack is not None else None
+                    )
+                    results.append({
+                        "site": grp_site,
+                        "tournament_id": grp_tid,
+                        "buy_in": buy_in,
+                        "hand_count": len(grp_rows),
+                        "first_hand_at": grp_rows[0]["date"],
+                        "last_hand_at": last_row["date"],
+                        "hero_chip_result": sum(float(r["hero_won"] or 0.0) for r in grp_rows),
+                        "hero_final_stack": hero_final_stack,
+                        "hero_busted_out": hero_busted_out,
+                        "tables_played": tables_played,
+                        "last_table_name": last_table,
+                        "min_seated_on_last_table": min_seated_on_last_table,
+                        "likely_final_table": bool(
+                            tables_played > 1
+                            and min_seated_on_last_table is not None
+                            and min_seated_on_last_table <= 3
+                        ),
+                        "finish_position": None,
+                        "prize": None,
+                        "source": "computed_from_hands",
+                    })
+                results.sort(key=lambda r: r["last_hand_at"] or "", reverse=True)
+                return results
             finally:
                 conn.close()
 
